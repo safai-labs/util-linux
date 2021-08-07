@@ -75,6 +75,7 @@ libblkid_la_SOURCES = \
 	libblkid/src/superblocks/mpool.c \
 	libblkid/src/superblocks/netware.c \
 	libblkid/src/superblocks/nilfs.c \
+	libblkid/src/superblocks/cellfs.c \
 	libblkid/src/superblocks/ntfs.c \
 	libblkid/src/superblocks/refs.c \
 	libblkid/src/superblocks/nvidia_raid.c \
