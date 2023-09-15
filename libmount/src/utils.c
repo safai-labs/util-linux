@@ -401,6 +401,7 @@ const char *mnt_statfs_get_fstype(struct statfs *vfs)
 	case STATFS_BFS_MAGIC:		return "befs";
 	case STATFS_BINFMTFS_MAGIC:	return "binfmt_misc";
 	case STATFS_BTRFS_MAGIC:	return "btrfs";
+	case STATFS_CELLFS_MAGIC:	return "cellfs";
 	case STATFS_CEPH_MAGIC:		return "ceph";
 	case STATFS_CGROUP_MAGIC:	return "cgroup";
 	case STATFS_CIFS_MAGIC:		return "cifs";
@@ -437,7 +438,6 @@ const char *mnt_statfs_get_fstype(struct statfs *vfs)
 	case STATFS_NCP_MAGIC:		return "ncp";
 	case STATFS_NFS_MAGIC:		return "nfs";
 	case STATFS_NILFS_MAGIC:	return "nilfs2";
-	case STATFS_CELLFS_MAGIC:	return "cellfs";
 	case STATFS_NTFS_MAGIC:		return "ntfs";
 	case STATFS_OCFS2_MAGIC:	return "ocfs2";
 	case STATFS_OMFS_MAGIC:		return "omfs";
