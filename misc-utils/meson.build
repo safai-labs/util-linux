@@ -39,6 +39,24 @@ lsblk_sources = files(
   'lsblk.h',
 )
 
+lsfd_sources = files (
+  'lsfd.c',
+  'lsfd.h',
+  'lsfd-filter.h',
+  'lsfd-filter.c',
+  'lsfd-counter.h',
+  'lsfd-counter.c',
+  'lsfd-decode-file-flags.c',
+  'lsfd-file.c',
+  'lsfd-cdev.c',
+  'lsfd-bdev.c',
+  'lsfd-sock.c',
+  'lsfd-sock.h',
+  'lsfd-sock-xinfo.c',
+  'lsfd-unkn.c',
+  'lsfd-fifo.c',
+)
+
 uuidgen_sources = files(
   'uuidgen.c',
 )
@@ -57,7 +75,7 @@ test_uuidd_sources = files(
   'test_uuidd.c',
 )
 
-if build_uuidd
+if build_uuidd and systemd.found()
   uuidd_service = configure_file(
     input : 'uuidd.service.in',
     output : 'uuidd.service',
@@ -73,6 +91,16 @@ if build_uuidd
   install_data(
     uuidd_socket,
     install_dir : systemdsystemunitdir)
+endif
+if build_uuidd and sysvinit
+  uuidd_rc = configure_file(
+    input : 'uuidd.rc.in',
+    output : 'uuidd.rc',
+    configuration : conf)
+  install_data(
+    uuidd_rc,
+    install_mode : 'rwxr-xr-x',
+    install_dir : sysvinitrcdir)
 endif
 
 blkid_sources = files(
@@ -109,7 +137,7 @@ getopt_sources = files(
 install_data(
   'getopt-example.bash',
   'getopt-example.tcsh',
-  install_dir : 'doc',
+  install_dir : docdir,
   install_mode: 'rwxr-xr-x')
 
 fincore_sources = files(
@@ -119,8 +147,25 @@ fincore_sources = files(
 hardlink_sources = files(
   'hardlink.c',
 ) + \
-  monotonic_c
+  monotonic_c + \
+  fileeq_c
 
 cal_sources = files(
   'cal.c',
+)
+
+pipesz_sources = files(
+  'pipesz.c',
+)
+
+fadvise_sources = files(
+  'fadvise.c',
+)
+
+waitpid_sources = files(
+  'waitpid.c',
+)
+
+lsclocks_sources = files(
+  'lsclocks.c',
 )

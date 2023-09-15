@@ -364,10 +364,13 @@ int scols_line_is_ancestor(struct libscols_line *ln, struct libscols_line *paren
  */
 int scols_line_set_color(struct libscols_line *ln, const char *color)
 {
-	if (color && isalnum(*color)) {
-		color = color_sequence_from_colorname(color);
-		if (!color)
+	if (color && !color_is_sequence(color)) {
+		char *seq = color_get_sequence(color);
+		if (!seq)
 			return -EINVAL;
+		free(ln->color);
+		ln->color = seq;
+		return 0;
 	}
 	return strdup_to_struct_member(ln, color, color);
 }
@@ -463,6 +466,26 @@ int scols_line_set_column_data(struct libscols_line *ln,
 {
 	return scols_line_set_data(ln, cl->seqnum, data);
 }
+
+/**
+ * scols_line_get_column_data:
+ * @ln: a pointer to a struct libscols_line instance
+ * @cl: column, whose data is to be get
+ *
+ * See also scols_cell_get_data()
+ *
+ * Returns: cell data or NULL.
+ *
+ * Since: 2.38
+ */
+const char *scols_line_get_column_data(struct libscols_line *ln,
+			       struct libscols_column *cl)
+{
+	struct libscols_cell *cell = scols_line_get_column_cell(ln, cl);
+
+	return cell ? scols_cell_get_data(cell) : NULL;
+}
+
 
 /**
  * scols_line_refer_data:

@@ -35,7 +35,7 @@ A _16-color_ can be an _8-color_, or *grey*, or *bright* followed by *red*, *gre
 
 The various color options may be set independently, at least on virtual consoles, though the results of setting multiple modes (for example, *--underline* and *--half-bright*) are hardware-dependent.
 
-The optional arguments require '=' (equals sign) and not space between the option and the argument. For example --option=argument.
+The optional arguments are recommended with '=' (equals sign) and not space between the option and the argument. For example --option=argument. *setterm* can interpret the next non-option argument as an optional argument too.
 
 *--appcursorkeys* on|off::
 Sets Cursor Key Application Mode on or off. When on, ESC O A, ESC O B, etc. will be sent for the cursor keys instead of ESC [ A, ESC [ B, etc. See the _vi and Cursor-Keys_ section of the _Text-Terminal-HOWTO_ for how this can cause problems for *vi* users. Virtual consoles only.
@@ -89,7 +89,7 @@ Sets the foreground text color.
 *--half-bright* on|off::
 Turns dim (half-brightness) mode on or off. Except on a virtual console, *--half-bright off* turns off all attributes (bold, half-brightness, blink, reverse).
 
-*--hbcolor* [bright] _16-color_::
+*--hbcolor* _16-color_::
 Sets the color for half-bright characters.
 
 *--initialize*::
@@ -134,7 +134,7 @@ Turns keyboard repeat on or off. Virtual consoles only.
 Displays the terminal reset string, which typically resets the terminal to its power-on state.
 
 *--resize*::
-Reset terminal size by assessing maximum row and column. This is useful when actual geometry and kernel terminal driver are not in sync. Most notable use case is with serial consoles, that do not use *ioctl*(3p) but just byte streams and breaks.
+Reset terminal size by assessing maximum row and column. This is useful when actual geometry and kernel terminal driver are not in sync. Most notable use case is with serial consoles, that do not use *ioctl*(2) but just byte streams and breaks.
 
 *--reverse* on|off::
 Turns reverse video mode on or off. Except on a virtual console, *--reverse off* turns off all attributes (bold, half-brightness, blink, reverse).
@@ -148,17 +148,13 @@ Sets tab stops at the given horizontal cursor positions, in the range *1-160*. W
 *--term* _terminal_name_::
 Overrides the *TERM* environment variable.
 
-*--ulcolor* [bright] _16-color_::
+*--ulcolor* _16-color_::
 Sets the color for underlined characters. Virtual consoles only.
 
 *--underline* on|off::
 Turns underline mode on or off.
 
-*--version*::
-Displays version information and exits.
-
-*--help*::
-Displays a help text and exits.
+include::man-common/help-version.adoc[]
 
 == COMPATIBILITY
 

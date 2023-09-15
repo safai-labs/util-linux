@@ -69,6 +69,9 @@ will print messages from system daemons only. For all supported facilities see t
 *-H*, *--human*::
 Enable human-readable output. See also *--color*, *--reltime* and *--nopager*.
 
+*-J*, *--json*::
+Use JSON output format. The time output format is in "sec.usec" format only, log priority level is not decoded by default (use *--decode* to split into facility and priority), the other options to control the output format or time format are silently ignored.
+
 *-k*, *--kernel*::
 Print kernel messages.
 
@@ -81,6 +84,14 @@ Restrict output to the given (comma-separated) _list_ of levels. For example:
 *dmesg --level=err,warn*
 +
 will print error and warning messages only. For all supported levels see the *--help* output.
++
+Appending a plus *+* to a level name also includes all higher levels. For example:
++
+*dmesg --level=err+*
++
+will print levels *err*, *crit*, *alert* and *emerg*.
++
+Prepending it will include all lower levels.
 
 *-n*, *--console-level* _level_::
 Set the _level_ at which printing of messages is done to the console. The _level_ is a level number or abbreviation of the level name. For all supported levels see the *--help* output.
@@ -113,10 +124,10 @@ Print human-readable timestamps.
 *Be aware that the timestamp could be inaccurate!* The *time* source used for the logs is *not updated after* system *SUSPEND*/*RESUME*. Timestamps are adjusted according to current delta between boottime and monotonic clocks, this works only for messages printed after last resume.
 
 *--since* _time_::
-Display record since the specified time. The time is possible to specify in absolute way as well as by relative notation (e.g. '1 hour ago'). Be aware that the timestamp could be inaccurate and see *--ctime* for more details.
+Display record since the specified time. Supported is the subsecond granularity. The time is possible to specify in absolute way as well as by relative notation (e.g. '1 hour ago'). Be aware that the timestamp could be inaccurate and see *--ctime* for more details.
 
 *--until* _time_::
-Display record until the specified time. The time is possible to specify in absolute way as well as by relative notation (e.g. '1 hour ago'). Be aware that the timestamp could be inaccurate and see *--ctime* for more details.
+Display record until the specified time. Supported is the subsecond granularity. The time is possible to specify in absolute way as well as by relative notation (e.g. '1 hour ago'). Be aware that the timestamp could be inaccurate and see *--ctime* for more details.
 
 *-t*, *--notime*::
 Do not print kernel's timestamps.
@@ -138,16 +149,9 @@ Wait and print only new messages.
 *-x*, *--decode*::
 Decode facility and level (priority) numbers to human-readable prefixes.
 
-*-V*, *--version*::
-Display version information and exit.
+include::man-common/help-version.adoc[]
 
-*-h*, *--help*::
-Display help text and exit.
-
-== COLORS
-
-Implicit coloring can be disabled by an empty file _/etc/terminal-colors.d/dmesg.disable_. See *terminal-colors.d*(5) for more details about colorization configuration.
-
+include::man-common/colors.adoc[]
 The logical color names supported by *dmesg* are:
 
 *subsys*::

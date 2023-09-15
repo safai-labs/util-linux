@@ -41,10 +41,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#ifdef USE_SULOGIN_EMERGENCY_MOUNT
+#if defined(USE_SULOGIN_EMERGENCY_MOUNT)
 # include <sys/mount.h>
-# include <linux/fs.h>
-# include <linux/magic.h>
+# ifndef MS_RELATIME
+#  define MS_RELATIME  (1<<21)
+# endif
 # ifndef MNT_DETACH
 #  define MNT_DETACH   2
 # endif
@@ -475,7 +476,7 @@ static int detect_consoles_from_cmdline(struct list_head *consoles)
 		goto done;
 	}
 
-	words= cmdline;
+	words = cmdline;
 	dir = opendir("/dev");
 	if (!dir)
 		goto done;

@@ -19,6 +19,7 @@
 #include <sys/types.h>
 
 #include "env.h"
+#include "all-io.h"
 
 #ifndef HAVE_ENVIRON_DECL
 extern char **environ;
@@ -69,6 +70,8 @@ static struct ul_env_list *env_list_add(struct ul_env_list *ls0, const char *str
 
 	sz = strlen(str) + 1;
 	p = malloc(sizeof(struct ul_env_list) + sz);
+	if (!p)
+		return ls0;
 
 	ls = (struct ul_env_list *) p;
 	p += sizeof(struct ul_env_list);
@@ -76,6 +79,32 @@ static struct ul_env_list *env_list_add(struct ul_env_list *ls0, const char *str
 	ls->env = p;
 
 	ls->next = ls0;
+	return ls;
+}
+
+/*
+ * Use env_from_fd() to read environment from @fd.
+ *
+ * @fd must be /proc/<pid>/environ file.
+*/
+struct ul_env_list *env_from_fd(int fd)
+{
+	char *buf = NULL, *p;
+	size_t rc = 0;
+	struct ul_env_list *ls = NULL;
+
+	if ((rc = read_all_alloc(fd, &buf)) < 1)
+		return NULL;
+	buf[rc] = '\0';
+	p = buf;
+
+	while (rc > 0) {
+		ls = env_list_add(ls, p);
+		p += strlen(p) + 1;
+		rc -= strlen(p) + 1;
+	}
+
+	free(buf);
 	return ls;
 }
 
@@ -112,7 +141,7 @@ void env_list_free(struct ul_env_list *ls)
 }
 
 /*
- * Removes unwanted variables from environ[]. If @ls is not NULL than stores
+ * Removes unwanted variables from environ[]. If @org is not NULL than stores
  * unwnated variables to the list.
  */
 void __sanitize_env(struct ul_env_list **org)
@@ -159,9 +188,7 @@ void sanitize_env(void)
 
 char *safe_getenv(const char *arg)
 {
-	uid_t ruid = getuid();
-
-	if (ruid != 0 || (ruid != geteuid()) || (getgid() != getegid()))
+	if ((getuid() != geteuid()) || (getgid() != getegid()))
 		return NULL;
 #ifdef HAVE_PRCTL
 	if (prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0)

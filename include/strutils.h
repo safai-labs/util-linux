@@ -1,3 +1,7 @@
+/*
+ * No copyright is claimed.  This code is in the public domain; do with
+ * it what you wish.
+ */
 #ifndef UTIL_LINUX_STRUTILS
 #define UTIL_LINUX_STRUTILS
 
@@ -42,10 +46,13 @@ extern uint64_t str2unum_or_err(const char *str, int base, const char *errmesg, 
 extern double strtod_or_err(const char *str, const char *errmesg);
 extern long double strtold_or_err(const char *str, const char *errmesg);
 
-extern long strtol_or_err(const char *str, const char *errmesg);
-extern unsigned long strtoul_or_err(const char *str, const char *errmesg);
+#define strtol_or_err(_s, _e)	(long) str2num_or_err(_s, 10, _e, LONG_MIN, LONG_MAX)
+#define strtopid_or_err(_s, _e)	(pid_t) str2num_or_err(_s, 10, _e, 1, SINT_MAX(pid_t))
+#define strtoul_or_err(_s, _e)	(unsigned long) str2unum_or_err(_s, 10, _e, ULONG_MAX)
 
 extern void strtotimeval_or_err(const char *str, struct timeval *tv,
+		const char *errmesg);
+extern void strtotimespec_or_err(const char *str, struct timespec *ts,
 		const char *errmesg);
 extern time_t strtotime_or_err(const char *str, const char *errmesg);
 
@@ -90,7 +97,8 @@ static inline void xstrncpy(char *dest, const char *src, size_t n)
  * Use this function to copy string to logs with fixed sizes (wtmp/utmp. ...)
  * where string terminator is optional.
  */
-static inline void *str2memcpy(void *dest, const char *src, size_t n)
+static inline void * __attribute__((nonnull (1)))
+str2memcpy(void *dest, const char *src, size_t n)
 {
 	size_t bytes = strlen(src) + 1;
 
@@ -101,13 +109,14 @@ static inline void *str2memcpy(void *dest, const char *src, size_t n)
 	return dest;
 }
 
-static inline char *mem2strcpy(char *dest, const void *src, size_t n, size_t nmax)
+static inline char * __attribute__((nonnull (1)))
+mem2strcpy(char *dest, const void *src, size_t n, size_t nmax)
 {
 	if (n + 1 > nmax)
 		n = nmax - 1;
 
+	memset(dest, '\0', nmax);
 	memcpy(dest, src, n);
-	dest[nmax-1] = '\0';
 	return dest;
 }
 
@@ -209,7 +218,8 @@ extern int string_add_to_idarray(const char *list, int ary[],
 				 int (name2id)(const char *, size_t));
 
 extern int string_to_bitarray(const char *list, char *ary,
-			    int (*name2bit)(const char *, size_t));
+			    int (*name2bit)(const char *, size_t),
+			    size_t allow_range);
 
 extern int string_to_bitmask(const char *list,
 			     unsigned long *mask,
@@ -378,13 +388,20 @@ static inline void strrem(char *s, int rem)
 	*p = '\0';
 }
 
-extern char *strnappend(const char *s, const char *suffix, size_t b);
-extern char *strappend(const char *s, const char *suffix);
-extern char *strfappend(const char *s, const char *format, ...)
+extern char *strnconcat(const char *s, const char *suffix, size_t b);
+extern char *strconcat(const char *s, const char *suffix);
+extern char *strfconcat(const char *s, const char *format, ...)
 		 __attribute__ ((__format__ (__printf__, 2, 3)));
+
+extern int strappend(char **a, const char *b);
+
 extern const char *split(const char **state, size_t *l, const char *separator, int quoted);
+
+extern char *ul_strchr_escaped(const char *s, int c);
 
 extern int skip_fline(FILE *fp);
 extern int ul_stralnumcmp(const char *p1, const char *p2);
+
+extern int ul_optstr_next(char **optstr, char **name, size_t *namesz, char **value, size_t *valsz);
 
 #endif

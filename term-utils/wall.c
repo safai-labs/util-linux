@@ -61,6 +61,11 @@
 #include <sys/types.h>
 #include <grp.h>
 
+#if defined(USE_SYSTEMD) && HAVE_DECL_SD_SESSION_GET_USERNAME == 1
+# include <systemd/sd-login.h>
+# include <systemd/sd-daemon.h>
+#endif
+
 #include "nls.h"
 #include "xalloc.h"
 #include "strutils.h"
@@ -72,6 +77,7 @@
 #include "fileutils.h"
 #include "closestream.h"
 #include "timeutils.h"
+#include "pwdutils.h"
 
 #define	TERM_WIDTH	79
 #define	WRITE_TIME_OUT	300		/* in seconds */
@@ -245,120 +251,85 @@ int main(int argc, char **argv)
 
 	iov.iov_base = mbuf;
 	iov.iov_len = mbufsize;
-	while((utmpptr = getutxent())) {
-		if (!utmpptr->ut_user[0])
-			continue;
-#ifdef USER_PROCESS
-		if (utmpptr->ut_type != USER_PROCESS)
-			continue;
+
+#if defined(USE_SYSTEMD) && HAVE_DECL_SD_SESSION_GET_USERNAME == 1
+	if (sd_booted() > 0) {
+		char **sessions_list;
+		int sessions;
+
+		sessions = sd_get_sessions(&sessions_list);
+		if (sessions < 0)
+			errx(EXIT_FAILURE, _("error getting sessions: %s"),
+				strerror(-sessions));
+
+		for (int i = 0; i < sessions; i++) {
+			char *name, *tty;
+			int r;
+
+			if ((r = sd_session_get_username(sessions_list[i], &name)) < 0)
+				errx(EXIT_FAILURE, _("get user name failed: %s"), strerror (-r));
+
+			if (!(group_buf && !is_gr_member(name, group_buf))) {
+				if (sd_session_get_tty(sessions_list[i], &tty) >= 0) {
+					if ((p = ttymsg(&iov, 1, tty, timeout)) != NULL)
+						warnx("%s", p);
+
+					free(tty);
+				}
+			}
+			free(name);
+			free(sessions_list[i]);
+		}
+		free(sessions_list);
+	} else
 #endif
-		/* Joey Hess reports that use-sessreg in /etc/X11/wdm/ produces
-		 * ut_line entries like :0, and a write to /dev/:0 fails.
-		 *
-		 * It also seems that some login manager may produce empty ut_line.
-		 */
-		if (!*utmpptr->ut_line || *utmpptr->ut_line == ':')
-			continue;
+	{
+		while ((utmpptr = getutxent())) {
+			if (!utmpptr->ut_user[0])
+				continue;
+#ifdef USER_PROCESS
+			if (utmpptr->ut_type != USER_PROCESS)
+				continue;
+#endif
+			/* Joey Hess reports that use-sessreg in /etc/X11/wdm/ produces
+			 * ut_line entries like :0, and a write to /dev/:0 fails.
+			 *
+			 * It also seems that some login manager may produce empty ut_line.
+			 */
+			if (!*utmpptr->ut_line || *utmpptr->ut_line == ':')
+				continue;
 
-		if (group_buf && !is_gr_member(utmpptr->ut_user, group_buf))
-			continue;
+			if (group_buf && !is_gr_member(utmpptr->ut_user, group_buf))
+				continue;
 
-		mem2strcpy(line, utmpptr->ut_line, sizeof(utmpptr->ut_line), sizeof(line));
-		if ((p = ttymsg(&iov, 1, line, timeout)) != NULL)
-			warnx("%s", p);
+			mem2strcpy(line, utmpptr->ut_line, sizeof(utmpptr->ut_line), sizeof(line));
+			if ((p = ttymsg(&iov, 1, line, timeout)) != NULL)
+				warnx("%s", p);
+		}
+		endutxent();
 	}
-	endutxent();
+
 	free(mbuf);
 	free_group_workspace(group_buf);
 	exit(EXIT_SUCCESS);
 }
 
-struct buffer {
-	size_t	sz;
-	size_t	used;
-	char	*data;
-};
-
-static void buf_enlarge(struct buffer *bs, size_t len)
-{
-	if (bs->sz == 0 || len > bs->sz - bs->used) {
-		bs->sz += len < 128 ? 128 : len;
-		bs->data = xrealloc(bs->data, bs->sz);
-	}
-}
-
-static void buf_puts(struct buffer *bs, const char *s)
-{
-	size_t len = strlen(s);
-
-	buf_enlarge(bs, len + 1);
-	memcpy(bs->data + bs->used, s, len + 1);
-	bs->used += len;
-}
-
-static void __attribute__((__format__ (__printf__, 2, 3)))
-	buf_printf(struct buffer *bs, const char *fmt, ...)
-{
-	int rc;
-	va_list ap;
-	size_t limit;
-
-	buf_enlarge(bs, 0);	/* default size */
-	limit = bs->sz - bs->used;
-
-	va_start(ap, fmt);
-	rc = vsnprintf(bs->data + bs->used, limit, fmt, ap);
-	va_end(ap);
-
-	if (rc >= 0 && (size_t) rc >= limit) {	/* not enough, enlarge */
-		buf_enlarge(bs, (size_t)rc + 1);
-		limit = bs->sz - bs->used;
-		va_start(ap, fmt);
-		rc = vsnprintf(bs->data  + bs->used, limit, fmt, ap);
-		va_end(ap);
-	}
-
-	if (rc > 0)
-		bs->used += rc;
-}
-
-static void buf_putc_careful(struct buffer *bs, int c)
-{
-	if (isprint(c) || c == '\a' || c == '\t' || c == '\r' || c == '\n') {
-		buf_enlarge(bs, 1);
-		bs->data[bs->used++] = c;
-	} else if (!c_isascii(c))
-		buf_printf(bs, "\\%3o", (unsigned char)c);
-	else {
-		char tmp[] = { '^', c ^ 0x40, '\0' };
-		buf_puts(bs, tmp);
-	}
-}
-
 static char *makemsg(char *fname, char **mvec, int mvecsz,
 		     size_t *mbufsize, int print_banner)
 {
-	struct buffer _bs = {.used = 0}, *bs = &_bs;
-	register int ch, cnt;
-	char *p, *lbuf;
-	long line_max;
-
-	line_max = sysconf(_SC_LINE_MAX);
-	if (line_max <= 0)
-		line_max = 512;
-
-	lbuf = xmalloc(line_max);
+	char *lbuf, *retbuf;
+	FILE * fs = open_memstream(&retbuf, mbufsize);
+	size_t lbuflen = 512;
+	lbuf = xmalloc(lbuflen);
 
 	if (print_banner == TRUE) {
 		char *hostname = xgethostname();
 		char *whom, *where, date[CTIME_BUFSIZ];
-		struct passwd *pw;
 		time_t now;
 
-		if (!(whom = getlogin()) || !*whom)
-			whom = (pw = getpwuid(getuid())) ? pw->pw_name : "???";
+		whom = xgetlogin();
 		if (!whom) {
-			whom = "someone";
+			whom = "<someone>";
 			warn(_("cannot get passwd uid"));
 		}
 		where = ttyname(STDOUT_FILENO);
@@ -380,15 +351,15 @@ static char *makemsg(char *fname, char **mvec, int mvecsz,
 		 */
 		/* snprintf is not always available, but the sprintf's here
 		   will not overflow as long as %d takes at most 100 chars */
-		buf_printf(bs, "\r%*s\r\n", TERM_WIDTH, " ");
+		fprintf(fs, "\r%*s\r\n", TERM_WIDTH, " ");
 
-		snprintf(lbuf, line_max,
+		snprintf(lbuf, lbuflen,
 				_("Broadcast message from %s@%s (%s) (%s):"),
 				whom, hostname, where, date);
-		buf_printf(bs, "%-*.*s\007\007\r\n", TERM_WIDTH, TERM_WIDTH, lbuf);
+		fprintf(fs, "%-*.*s\007\007\r\n", TERM_WIDTH, TERM_WIDTH, lbuf);
 		free(hostname);
 	}
-	buf_printf(bs, "%*s\r\n", TERM_WIDTH, " ");
+	fprintf(fs, "%*s\r\n", TERM_WIDTH, " ");
 
 	 if (mvec) {
 		/*
@@ -397,11 +368,11 @@ static char *makemsg(char *fname, char **mvec, int mvecsz,
 		int i;
 
 		for (i = 0; i < mvecsz; i++) {
-			buf_puts(bs, mvec[i]);
+			fputs(mvec[i], fs);
 			if (i < mvecsz - 1)
-				buf_puts(bs, " ");
+				fputc(' ', fs);
 		}
-		buf_puts(bs, "\r\n");
+		fputs("\r\n", fs);
 	} else {
 		/*
 		 * read message from <file>
@@ -426,26 +397,13 @@ static char *makemsg(char *fname, char **mvec, int mvecsz,
 		/*
 		 * Read message from stdin.
 		 */
-		while (fgets(lbuf, line_max, stdin)) {
-			for (cnt = 0, p = lbuf; (ch = *p) != '\0'; ++p, ++cnt) {
-				if (cnt == TERM_WIDTH || ch == '\n') {
-					for (; cnt < TERM_WIDTH; ++cnt)
-						buf_puts(bs, " ");
-					buf_puts(bs, "\r\n");
-					cnt = 0;
-				}
-				if (ch == '\t')
-					cnt += (7 - (cnt % 8));
-				if (ch != '\n')
-					buf_putc_careful(bs, ch);
-			}
-		}
+		while (getline(&lbuf, &lbuflen, stdin) >= 0)
+			fputs_careful(lbuf, fs, '^', true, TERM_WIDTH);
 	}
-	buf_printf(bs, "%*s\r\n", TERM_WIDTH, " ");
+	fprintf(fs, "%*s\r\n", TERM_WIDTH, " ");
 
 	free(lbuf);
 
-	bs->data[bs->used] = '\0';	/* be paranoid */
-	*mbufsize = bs->used;
-	return bs->data;
+	fclose(fs);
+	return retbuf;
 }

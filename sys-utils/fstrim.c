@@ -35,6 +35,7 @@
 
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <linux/fs.h>
 
 #include "nls.h"
@@ -45,6 +46,7 @@
 #include "pathnames.h"
 #include "sysfs.h"
 #include "optutils.h"
+#include "statfs_magic.h"
 
 #include <libmount.h>
 
@@ -60,6 +62,7 @@ struct fstrim_range {
 
 struct fstrim_control {
 	struct fstrim_range range;
+	char *type_pattern;
 
 	unsigned int verbose : 1,
 		     quiet_unsupp : 1,
@@ -120,6 +123,7 @@ static int fstrim_filesystem(struct fstrim_control *ctl, const char *path, const
 		case EBADF:
 		case ENOTTY:
 		case EOPNOTSUPP:
+		case ENOSYS:
 			rc = 1;
 			break;
 		default:
@@ -207,6 +211,43 @@ fail:
 	return 1;
 }
 
+static int is_unwanted_fs(struct libmnt_fs *fs, const char *tgt, const char *types)
+{
+	struct statfs vfs;
+	int fd, rc;
+
+	if (mnt_fs_is_pseudofs(fs))
+		return 1;
+	if (mnt_fs_is_netfs(fs))
+		return 1;
+	if (mnt_fs_is_swaparea(fs))
+		return 1;
+	if (mnt_fs_match_fstype(fs, "autofs"))
+		return 1;
+	if (mnt_fs_match_options(fs, "ro"))
+		return 1;
+	if (mnt_fs_match_options(fs, "+X-fstrim.notrim"))
+		return 1;
+	if (types && mnt_fs_match_fstype(fs, types) == 0)
+		return 1;
+
+	fd = open(tgt, O_PATH);
+	if (fd < 0)
+		return 1;
+	rc = fstatfs(fd, &vfs) != 0 || vfs.f_type == STATFS_AUTOFS_MAGIC;
+	close(fd);
+	if (rc)
+		return 1;
+
+	/* FITRIM on read-only filesystem can fail, and it can fail */
+	if (access(tgt, W_OK) != 0) {
+		if (errno == EROFS)
+			return 1;
+		if (errno == EACCES)
+			return 1;
+	}
+	return 0;
+}
 
 static int uniq_fs_target_cmp(
 		struct libmnt_table *tb __attribute__((__unused__)),
@@ -291,8 +332,10 @@ static int fstrim_all_from_file(struct fstrim_control *ctl, const char *filename
 	while (mnt_table_next_fs(tab, itr, &fs) == 0) {
 		const char *src = mnt_fs_get_srcpath(fs),
 			   *tgt = mnt_fs_get_target(fs);
+		char *path;
+		int rc = 1;
 
-		if (!tgt || mnt_fs_is_pseudofs(fs) || mnt_fs_is_netfs(fs)) {
+		if (!tgt || is_unwanted_fs(fs, tgt, ctl->type_pattern)) {
 			mnt_table_remove_fs(tab, fs);
 			continue;
 		}
@@ -313,6 +356,23 @@ static int fstrim_all_from_file(struct fstrim_control *ctl, const char *filename
 			mnt_table_remove_fs(tab, fs);
 			continue;
 		}
+
+		/* Is it really accessible mountpoint? Not all mountpoints are
+		 * accessible (maybe over mounted by another filesystem) */
+		path = mnt_get_mountpoint(tgt);
+		if (path && streq_paths(path, tgt))
+			rc = 0;
+		free(path);
+		if (rc) {
+			mnt_table_remove_fs(tab, fs);
+			continue;	/* overlaying mount */
+		}
+
+		if (!is_directory(tgt, 1) ||
+		    !has_discard(src, &wholedisk)) {
+			mnt_table_remove_fs(tab, fs);
+			continue;
+		}
 	}
 
 	/* de-duplicate by source */
@@ -324,29 +384,8 @@ static int fstrim_all_from_file(struct fstrim_control *ctl, const char *filename
 	while (mnt_table_next_fs(tab, itr, &fs) == 0) {
 		const char *src = mnt_fs_get_srcpath(fs),
 			   *tgt = mnt_fs_get_target(fs);
-		char *path;
-		int rc = 1;
+		int rc;
 
-		/* Is it really accessible mountpoint? Not all mountpoints are
-		 * accessible (maybe over mounted by another filesystem) */
-		path = mnt_get_mountpoint(tgt);
-		if (path && streq_paths(path, tgt))
-			rc = 0;
-		free(path);
-		if (rc)
-			continue;	/* overlaying mount */
-
-		/* FITRIM on read-only filesystem can fail, and it can fail */
-		if (access(tgt, W_OK) != 0) {
-			if (errno == EROFS)
-				continue;
-			if (errno == EACCES)
-				continue;
-		}
-
-		if (!is_directory(tgt, 1) ||
-		    !has_discard(src, &wholedisk))
-			continue;
 		cnt++;
 
 		/*
@@ -424,6 +463,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -o, --offset <num>       the offset in bytes to start discarding from\n"), out);
 	fputs(_(" -l, --length <num>       the number of bytes to discard\n"), out);
 	fputs(_(" -m, --minimum <num>      the minimum extent length to discard\n"), out);
+	fputs(_(" -t, --types <list>       limit the set of filesystem types\n"), out);
 	fputs(_(" -v, --verbose            print number of discarded bytes\n"), out);
 	fputs(_("     --quiet-unsupported  suppress error messages if trim unsupported\n"), out);
 	fputs(_(" -n, --dry-run            does everything, but trim\n"), out);
@@ -459,6 +499,7 @@ int main(int argc, char **argv)
 	    { "offset",    required_argument, NULL, 'o' },
 	    { "length",    required_argument, NULL, 'l' },
 	    { "minimum",   required_argument, NULL, 'm' },
+	    { "types",     required_argument, NULL, 't' },
 	    { "verbose",   no_argument,       NULL, 'v' },
 	    { "quiet-unsupported", no_argument,       NULL, OPT_QUIET_UNSUPP },
 	    { "dry-run",   no_argument,       NULL, 'n' },
@@ -476,7 +517,7 @@ int main(int argc, char **argv)
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	while ((c = getopt_long(argc, argv, "AahI:l:m:no:Vv", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "AahI:l:m:no:t:Vv", longopts, NULL)) != -1) {
 
 		err_exclusive_options(c, longopts, excl, excl_st);
 
@@ -507,6 +548,9 @@ int main(int argc, char **argv)
 		case 'm':
 			ctl.range.minlen = strtosize_or_err(optarg,
 					_("failed to parse minimum extent length"));
+			break;
+		case 't':
+			ctl.type_pattern = optarg;
 			break;
 		case 'v':
 			ctl.verbose = 1;

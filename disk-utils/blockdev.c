@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <errno.h>
+#ifdef HAVE_LINUX_BLKZONED_H
+#include <linux/blkzoned.h>
+#endif
 
 #include "c.h"
 #include "nls.h"
@@ -169,6 +172,20 @@ static const struct bdc bdcms[] =
 		.argval = -1,
 		.help = N_("get filesystem readahead")
 	},{
+		IOCTL_ENTRY(BLKGETDISKSEQ),
+		.name = "--getdiskseq",
+		.argtype = ARG_ULLONG,
+		.argval = -1,
+		.help = N_("get disk sequence number")
+	},{
+#ifdef BLKGETZONESZ
+		IOCTL_ENTRY(BLKGETZONESZ),
+		.name = "--getzonesz",
+		.argtype = ARG_UINT,
+		.argval = -1,
+		.help = N_("get zone size")
+	},{
+#endif
 		IOCTL_ENTRY(BLKFLSBUF),
 		.name = "--flushbufs",
 		.help = N_("flush buffers")
@@ -442,7 +459,7 @@ static void report_all_devices(void)
 			   &ma, &mi, &sz, ptname) != 4)
 			continue;
 
-		sprintf(device, "/dev/%s", ptname);
+		snprintf(device, sizeof(device), "/dev/%s", ptname);
 		report_device(device, 1);
 	}
 
@@ -456,7 +473,7 @@ static void report_device(char *device, int quiet)
 	long ra;
 	unsigned long long bytes;
 	uint64_t start = 0;
-	char start_str[11] = { "\0" };
+	char start_str[16] = { "\0" };
 	struct stat st;
 
 	fd = open(device, O_RDONLY | O_NONBLOCK);
@@ -478,20 +495,20 @@ static void report_device(char *device, int quiet)
 		    disk != st.st_rdev) {
 
 			if (ul_path_read_u64(pc, &start, "start") != 0)
-				/* TRANSLATORS: Start sector not available. Max. 10 letters. */
-				sprintf(start_str, "%10s", _("N/A"));
+				/* TRANSLATORS: Start sector not available. Max. 15 letters. */
+				snprintf(start_str, sizeof(start_str), "%15s", _("N/A"));
 		}
 		ul_unref_path(pc);
 	}
 	if (!*start_str)
-		sprintf(start_str, "%10ju", start);
+		snprintf(start_str, sizeof(start_str), "%15ju", start);
 
 	if (ioctl(fd, BLKROGET, &ro) == 0 &&
 	    ioctl(fd, BLKRAGET, &ra) == 0 &&
 	    ioctl(fd, BLKSSZGET, &ssz) == 0 &&
 	    ioctl(fd, BLKBSZGET, &bsz) == 0 &&
 	    blkdev_get_size(fd, &bytes) == 0) {
-		printf("%s %5ld %5d %5d %s %15lld   %s\n",
+		printf("%s %5ld %5d %5d %s %15lld   %s\n",
 			ro ? "ro" : "rw", ra, ssz, bsz, start_str, bytes, device);
 	} else {
 		if (!quiet)
@@ -503,5 +520,5 @@ static void report_device(char *device, int quiet)
 
 static void report_header(void)
 {
-	printf(_("RO    RA   SSZ   BSZ   StartSec            Size   Device\n"));
+	printf(_("RO    RA   SSZ   BSZ        StartSec            Size   Device\n"));
 }

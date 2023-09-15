@@ -56,7 +56,7 @@ struct mac_driver_desc {
 	/* there is more stuff after this that we don't need */
 } __attribute__((packed));
 
-static inline unsigned char *get_mac_block(
+static inline const unsigned char *get_mac_block(
 					blkid_probe pr,
 					uint16_t block_size,
 					uint32_t num)
@@ -93,6 +93,8 @@ static int probe_mac_pt(blkid_probe pr,
 	}
 
 	block_size = be16_to_cpu(md->block_size);
+	if (block_size < sizeof(struct mac_partition))
+		goto nothing;
 
 	/* The partition map always begins at physical block 1,
 	 * the second block on the disk.

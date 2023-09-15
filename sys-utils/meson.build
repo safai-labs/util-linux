@@ -36,6 +36,10 @@ renice_sources = files(
   'renice.c',
 )
 
+setpgid_sources = files(
+  'setpgid.c',
+)
+
 setsid_sources = files(
   'setsid.c',
 )
@@ -55,7 +59,7 @@ fstrim_sources = files(
 dmesg_sources = files(
   'dmesg.c',
 ) + \
-  monotonic_c
+  monotonic_c + pager_c
 
 ctrlaltdel_sources = files(
   'ctrlaltdel.c',
@@ -72,6 +76,10 @@ blkdiscard_sources = files(
 
 blkzone_sources = files(
   'blkzone.c',
+)
+
+blkpr_sources = files(
+  'blkpr.c',
 )
 
 ldattach_sources = files(
@@ -220,12 +228,14 @@ if LINUX
   ]
 endif
 
-fstrim_service = configure_file(
-  input : 'fstrim.service.in',
-  output : 'fstrim.service',
-  configuration : conf)
+if systemd.found()
+  fstrim_service = configure_file(
+    input : 'fstrim.service.in',
+    output : 'fstrim.service',
+    configuration : conf)
 
-install_data(fstrim_service,
-             install_dir : systemdsystemunitdir)
-install_data('fstrim.timer',
-             install_dir : systemdsystemunitdir)
+  install_data(fstrim_service,
+               install_dir : systemdsystemunitdir)
+  install_data('fstrim.timer',
+               install_dir : systemdsystemunitdir)
+endif

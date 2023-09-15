@@ -36,6 +36,11 @@
 #include <sys/wait.h>
 #include <syslog.h>
 #include <utmpx.h>
+#include <sys/time.h>
+
+#ifdef HAVE_SYS_RESOURCE_H
+# include <sys/resource.h>
+#endif
 
 #ifdef HAVE_PTY
 # include <pty.h>
@@ -63,6 +68,7 @@
 
 #include "logindefs.h"
 #include "su-common.h"
+#include "shells.h"
 
 #include "debug.h"
 
@@ -159,7 +165,7 @@ struct su_context {
 };
 
 
-static sig_atomic_t volatile caught_signal = false;
+static sig_atomic_t volatile caught_signal = 0;
 
 /* Signal handler for parent process.  */
 static void
@@ -283,7 +289,7 @@ static void log_syslog(struct su_context *su, bool successful)
 {
 	DBG(LOG, ul_debug("syslog logging"));
 
-	openlog(program_invocation_short_name, 0, LOG_AUTH);
+	openlog(program_invocation_short_name, LOG_PID, LOG_AUTH);
 	syslog(LOG_NOTICE, "%s(to %s) %s on %s",
 	       successful ? "" :
 	       su->runuser ? "FAILED RUNUSER " : "FAILED SU ",
@@ -337,6 +343,8 @@ static int supam_conv(	int num_msg,
 	return misc_conv(num_msg, msg, resp, data);
 #elif defined(HAVE_SECURITY_OPENPAM_H)
 	return openpam_ttyconv(num_msg, msg, resp, data);
+#else
+	return PAM_CONV_ERR;
 #endif
 }
 
@@ -517,6 +525,7 @@ static void parent_setup_signals(struct su_context *su)
 
 static void create_watching_parent(struct su_context *su)
 {
+	struct sigaction action;
 	int status;
 
 	DBG(MISC, ul_debug("forking..."));
@@ -536,9 +545,24 @@ static void create_watching_parent(struct su_context *su)
 		/* create pty */
 		if (ul_pty_setup(su->pty))
 			err(EXIT_FAILURE, _("failed to create pseudo-terminal"));
+		if (ul_pty_signals_setup(su->pty))
+			err(EXIT_FAILURE, _("failed to initialize signals handler"));
 	}
 #endif
 	fflush(stdout);			/* ??? */
+
+	/* set default handler for SIGCHLD */
+	sigemptyset(&action.sa_mask);
+	action.sa_flags = 0;
+	action.sa_handler = SIG_DFL;
+	if (sigaction(SIGCHLD, &action, NULL)) {
+		supam_cleanup(su, PAM_ABORT);
+#ifdef USE_PTY
+		if (su->force_pty)
+			ul_pty_cleanup(su->pty);
+#endif
+		err(EXIT_FAILURE, _("cannot set child signal handler"));
+	}
 
 	switch ((int) (su->child = fork())) {
 	case -1: /* error */
@@ -846,18 +870,14 @@ static void run_shell(
  */
 static bool is_restricted_shell(const char *shell)
 {
-	char *line;
-
-	setusershell();
-	while ((line = getusershell()) != NULL) {
-		if (*line != '#' && !strcmp(line, shell)) {
-			endusershell();
-			return false;
-		}
+	if (is_known_shell(shell)) {
+		return false;
 	}
-	endusershell();
-
+#ifdef USE_VENDORDIR
+	DBG(MISC, ul_debug("%s is restricted shell (not in e.g. vendor shells file, /etc/shells, ...)", shell));
+#else
 	DBG(MISC, ul_debug("%s is restricted shell (not in /etc/shells)", shell));
+#endif
 	return true;
 }
 
@@ -952,6 +972,35 @@ static int is_not_root(void)
 
 	/* if we're really root and aren't running setuid */
 	return (uid_t) 0 == ruid && ruid == euid ? 0 : 1;
+}
+
+/* Don't rely on PAM and reset the most important limits. */
+static void sanitize_prlimits(void)
+{
+#ifdef HAVE_SYS_RESOURCE_H
+	struct rlimit lm = { .rlim_cur = 0, .rlim_max = 0 };
+
+	/* reset to zero */
+#ifdef RLIMIT_NICE
+	setrlimit(RLIMIT_NICE, &lm);
+#endif
+#ifdef RLIMIT_RTPRIO
+	setrlimit(RLIMIT_RTPRIO, &lm);
+#endif
+
+	/* reset to unlimited */
+	lm.rlim_cur = RLIM_INFINITY;
+	lm.rlim_max = RLIM_INFINITY;
+	setrlimit(RLIMIT_FSIZE, &lm);
+	setrlimit(RLIMIT_AS, &lm);
+
+	/* reset soft limit only */
+	getrlimit(RLIMIT_NOFILE, &lm);
+	if (lm.rlim_cur != FD_SETSIZE) {
+		lm.rlim_cur = FD_SETSIZE;
+		setrlimit(RLIMIT_NOFILE, &lm);
+	}
+#endif
 }
 
 static gid_t add_supp_group(const char *name, gid_t **groups, size_t *ngroups)
@@ -1195,6 +1244,8 @@ int su_main(int argc, char **argv, int mode)
 	if (!su->simulate_login || command)
 		su->suppress_pam_info = 1;	/* don't print PAM info messages */
 
+	sanitize_prlimits();
+
 	supam_open_session(su);
 
 #ifdef USE_PTY
@@ -1230,6 +1281,9 @@ int su_main(int argc, char **argv, int mode)
 
 	if (su->simulate_login && chdir(su->pwd->pw_dir) != 0)
 		warn(_("warning: cannot change directory to %s"), su->pwd->pw_dir);
+
+	/* http://www.linux-pam.org/Linux-PAM-html/adg-interface-by-app-expected.html#adg-pam_end */
+	(void) pam_end(su->pamh, PAM_SUCCESS|PAM_DATA_SILENT);
 
 	if (shell)
 		run_shell(su, shell, command, argv + optind, max(0, argc - optind));

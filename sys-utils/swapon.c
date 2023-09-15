@@ -77,10 +77,10 @@ enum {
 
 /* column names */
 struct colinfo {
-        const char *name; /* header */
-        double     whint; /* width hint (N < 1 is in percent of termwidth) */
-	int        flags; /* SCOLS_FL_* */
-        const char *help;
+        const char * const	name; /* header */
+        double			whint; /* width hint (N < 1 is in percent of termwidth) */
+	int			flags; /* SCOLS_FL_* */
+        const char		*help;
 };
 
 enum {
@@ -92,7 +92,7 @@ enum {
 	COL_UUID,
 	COL_LABEL
 };
-static struct colinfo infos[] = {
+static const struct colinfo infos[] = {
 	[COL_PATH]     = { "NAME",	0.20, 0, N_("device file or partition path") },
 	[COL_TYPE]     = { "TYPE",	0.20, SCOLS_FL_TRUNC, N_("type of the device")},
 	[COL_SIZE]     = { "SIZE",	0.20, SCOLS_FL_RIGHT, N_("size of the swap area")},
@@ -159,7 +159,7 @@ static inline int get_column_id(const struct swapon_ctl *ctl, int num)
 	return ctl->columns[num];
 }
 
-static inline struct colinfo *get_column_info(const struct swapon_ctl *ctl, unsigned num)
+static inline const struct colinfo *get_column_info(const struct swapon_ctl *ctl, unsigned num)
 {
 	return &infos[get_column_id(ctl, num)];
 }
@@ -299,7 +299,7 @@ static int show_table(struct swapon_ctl *ctl)
 	scols_table_enable_noheadings(table, ctl->no_heading);
 
 	for (i = 0; i < ctl->ncolumns; i++) {
-		struct colinfo *col = get_column_info(ctl, i);
+		const struct colinfo *col = get_column_info(ctl, i);
 
 		if (!scols_table_new_column(table, col->name, col->whint, col->flags))
 			err(EXIT_FAILURE, _("failed to allocate output column"));
@@ -543,7 +543,7 @@ static int swapon_checks(const struct swapon_ctl *ctl, struct swap_device *dev)
 
 	/* test for holes by LBT */
 	if (S_ISREG(st.st_mode)) {
-		if (st.st_blocks * 512 < st.st_size) {
+		if (st.st_blocks * 512L < st.st_size) {
 			warnx(_("%s: skipping - it appears to have holes."),
 				dev->path);
 			goto err;
@@ -735,9 +735,9 @@ static int parse_options(struct swap_prop *props, const char *options)
 }
 
 
-static int swapon_all(struct swapon_ctl *ctl)
+static int swapon_all(struct swapon_ctl *ctl, const char *filename)
 {
-	struct libmnt_table *tb = get_fstab();
+	struct libmnt_table *tb = get_fstab(filename);
 	struct libmnt_iter *itr;
 	struct libmnt_fs *fs;
 	int status = 0;
@@ -817,6 +817,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -o, --options <list>     comma-separated list of swap options\n"), out);
 	fputs(_(" -p, --priority <prio>    specify the priority of the swap device\n"), out);
 	fputs(_(" -s, --summary            display summary about used swap devices (DEPRECATED)\n"), out);
+	fputs(_(" -T, --fstab <path>       alternative file to /etc/fstab\n"), out);
 	fputs(_("     --show[=<columns>]   display summary in definable table\n"), out);
 	fputs(_("     --noheadings         don't print table heading (with --show)\n"), out);
 	fputs(_("     --raw                use the raw output format (with --show)\n"), out);
@@ -853,7 +854,7 @@ int main(int argc, char *argv[])
 {
 	int status = 0, c;
 	size_t i;
-	char *options = NULL;
+	char *options = NULL, *fstab_filename = NULL;
 
 	enum {
 		BYTES_OPTION = CHAR_MAX + 1,
@@ -879,6 +880,7 @@ int main(int argc, char *argv[])
 		{ "noheadings", no_argument,       NULL, NOHEADINGS_OPTION },
 		{ "raw",        no_argument,       NULL, RAW_OPTION        },
 		{ "bytes",      no_argument,       NULL, BYTES_OPTION      },
+		{ "fstab",      required_argument, NULL, 'T'               },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -904,7 +906,7 @@ int main(int argc, char *argv[])
 	mnt_init_debug(0);
 	mntcache = mnt_new_cache();
 
-	while ((c = getopt_long(argc, argv, "ahd::efo:p:svVL:U:",
+	while ((c = getopt_long(argc, argv, "ahd::efo:p:svVL:U:T:",
 				long_opts, NULL)) != -1) {
 
 		err_exclusive_options(c, long_opts, excl, excl_st);
@@ -925,6 +927,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'U':
 			add_uuid(optarg);
+			break;
+		case 'T':
+			fstab_filename = optarg;
 			break;
 		case 'd':
 			ctl.props.discard |= SWAP_FLAG_DISCARD;
@@ -1008,7 +1013,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (ctl.all)
-		status |= swapon_all(&ctl);
+		status |= swapon_all(&ctl, fstab_filename);
 
 	if (options)
 		parse_options(&ctl.props, options);

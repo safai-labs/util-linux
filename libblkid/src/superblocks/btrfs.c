@@ -11,15 +11,32 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <inttypes.h>
 
 #ifdef HAVE_LINUX_BLKZONED_H
 #include <linux/blkzoned.h>
 #endif
 
 #include "superblocks.h"
+#include "crc32c.h"
+#include "sha256.h"
+#include "xxhash.h"
+
+enum btrfs_super_block_csum_type {
+	BTRFS_SUPER_BLOCK_CSUM_TYPE_CRC32C = 0,
+	BTRFS_SUPER_BLOCK_CSUM_TYPE_XXHASH = 1,
+	BTRFS_SUPER_BLOCK_CSUM_TYPE_SHA256 = 2,
+};
+
+union btrfs_super_block_csum {
+	uint8_t bytes[32];
+	uint32_t crc32c;
+	XXH64_hash_t xxh64;
+	uint8_t sha256[UL_SHA256LENGTH];
+};
 
 struct btrfs_super_block {
-	uint8_t csum[32];
+	union btrfs_super_block_csum csum;
 	uint8_t fsid[16];
 	uint64_t bytenr;
 	uint64_t flags;
@@ -63,6 +80,7 @@ struct btrfs_super_block {
 		uint8_t fsid[16];
 	} __attribute__ ((__packed__)) dev_item;
 	uint8_t label[256];
+	uint8_t padding[3541]; /* pad to BTRFS_SUPER_INFO_SIZE for csum calculation */
 } __attribute__ ((__packed__));
 
 #define BTRFS_SUPER_INFO_SIZE 4096
@@ -102,7 +120,7 @@ static int sb_write_pointer(blkid_probe pr, struct blk_zone *zones, uint64_t *wp
 	 *   *: Special case, no superblock is written
 	 *   0: Use write pointer of zones[0]
 	 *   1: Use write pointer of zones[1]
-	 *   C: Compare super blcoks from zones[0] and zones[1], use the latest
+	 *   C: Compare super blocks from zones[0] and zones[1], use the latest
 	 *      one determined by generation
 	 *   x: Invalid state
 	 */
@@ -126,6 +144,10 @@ static int sb_write_pointer(blkid_probe pr, struct blk_zone *zones, uint64_t *wp
 				blkid_probe_get_buffer(pr, bytenr, BTRFS_SUPER_INFO_SIZE);
 			if (!super[i])
 				return -EIO;
+			DBG(LOWPROBE, ul_debug("(btrfs) checking #%d zone "
+						"[start=%" PRIu64", len=%" PRIu64", sb-offset=%" PRIu64"]",
+						i, (uint64_t) zones[i].start,
+						(uint64_t) zones[i].len, bytenr));
 		}
 
 		if (super[0]->generation > super[1]->generation)
@@ -140,6 +162,8 @@ static int sb_write_pointer(blkid_probe pr, struct blk_zone *zones, uint64_t *wp
 		return -EUCLEAN;
 	}
 	*wp_ret = sector << SECTOR_SHIFT;
+
+	DBG(LOWPROBE, ul_debug("(btrfs) write pointer: %" PRIu64" sector", sector));
 	return 0;
 }
 
@@ -168,6 +192,7 @@ static int sb_log_offset(blkid_probe pr, uint64_t *bytenr_ret)
 	 */
 	for (i = 0; i < BTRFS_NR_SB_LOG_ZONES; i++) {
 		if (zones[i].type == BLK_ZONE_TYPE_CONVENTIONAL) {
+			DBG(LOWPROBE, ul_debug("(btrfs) checking conventional zone"));
 			*bytenr_ret = zones[i].start << SECTOR_SHIFT;
 			ret = 0;
 			goto out;
@@ -194,6 +219,35 @@ out:
 }
 #endif
 
+static int btrfs_verify_csum(blkid_probe pr, const struct btrfs_super_block *bfs)
+{
+	uint16_t csum_type = le16_to_cpu(bfs->csum_type);
+	const void *csum_data = (char *) bfs + sizeof(bfs->csum);
+	size_t csum_data_size = sizeof(*bfs) - sizeof(bfs->csum);
+	switch (csum_type) {
+		case BTRFS_SUPER_BLOCK_CSUM_TYPE_CRC32C: {
+			uint32_t crc = ~crc32c(~0L, csum_data, csum_data_size);
+			return blkid_probe_verify_csum(pr, crc,
+					le32_to_cpu(bfs->csum.crc32c));
+		}
+		case BTRFS_SUPER_BLOCK_CSUM_TYPE_XXHASH: {
+			XXH64_hash_t xxh64 = XXH64(csum_data, csum_data_size, 0);
+			return blkid_probe_verify_csum(pr, xxh64,
+					le64_to_cpu(bfs->csum.xxh64));
+		}
+		case BTRFS_SUPER_BLOCK_CSUM_TYPE_SHA256: {
+			uint8_t sha256[UL_SHA256LENGTH];
+			ul_SHA256(sha256, csum_data, csum_data_size);
+			return blkid_probe_verify_csum_buf(pr, UL_SHA256LENGTH,
+					sha256, bfs->csum.sha256);
+		}
+		default:
+			DBG(LOWPROBE, ul_debug("(btrfs) unknown checksum type %d, skipping validation",
+					       csum_type));
+			return 1;
+	}
+}
+
 static int probe_btrfs(blkid_probe pr, const struct blkid_idmag *mag)
 {
 	struct btrfs_super_block *bfs;
@@ -219,6 +273,13 @@ static int probe_btrfs(blkid_probe pr, const struct blkid_idmag *mag)
 	if (!bfs)
 		return errno ? -errno : 1;
 
+	if (!btrfs_verify_csum(pr, bfs))
+		return 1;
+
+	/* Invalid sector size; total_bytes would be bogus. */
+	if (!le32_to_cpu(bfs->sectorsize))
+		return 1;
+
 	if (*bfs->label)
 		blkid_probe_set_label(pr,
 				(unsigned char *) bfs->label,
@@ -226,7 +287,21 @@ static int probe_btrfs(blkid_probe pr, const struct blkid_idmag *mag)
 
 	blkid_probe_set_uuid(pr, bfs->fsid);
 	blkid_probe_set_uuid_as(pr, bfs->dev_item.uuid, "UUID_SUB");
+	blkid_probe_set_fsblocksize(pr, le32_to_cpu(bfs->sectorsize));
 	blkid_probe_set_block_size(pr, le32_to_cpu(bfs->sectorsize));
+
+	uint32_t sectorsize_log = 31 -
+		__builtin_clz(le32_to_cpu(bfs->sectorsize));
+	blkid_probe_set_fslastblock(pr,
+			le64_to_cpu(bfs->total_bytes) >> sectorsize_log);
+
+	/* The size is calculated without the RAID factor. It could not be
+	 * obtained from the superblock as it is property of device tree.
+	 *  Without the factor we would show fs size with the redundant data. The
+	 * acquisition of the factor will require additional parsing of btrfs
+	 * tree.
+	 */
+	blkid_probe_set_fssize(pr, le64_to_cpu(bfs->total_bytes));
 
 	return 0;
 }

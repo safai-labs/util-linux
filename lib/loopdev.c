@@ -43,6 +43,8 @@
 #include "debug.h"
 #include "fileutils.h"
 
+#define LOOPDEV_MAX_TRIES	10
+
 /*
  * Debug stuff (based on include/debug.h)
  */
@@ -75,6 +77,24 @@ static void loopdev_init_debug(void)
 					 && !loopcxt_ioctl_enabled(_lc)
 
 /*
+ * Calls @x and repeat on EAGAIN
+ */
+#define repeat_on_eagain(x) __extension__ ({			\
+		int _c = 0, _e;					\
+		do {						\
+			errno = 0;				\
+			_e = x;					\
+			if (_e == 0 || errno != EAGAIN)		\
+				break;				\
+			if (_c >= LOOPDEV_MAX_TRIES)		\
+				break;				\
+			xusleep(250000);			\
+			_c++;					\
+		} while (1);					\
+		_e == 0 ? 0 : errno ? -errno : -1;		\
+	})
+
+/*
  * @lc: context
  * @device: device name, absolute device path or NULL to reset the current setting
  *
@@ -96,7 +116,7 @@ int loopcxt_set_device(struct loopdev_cxt *lc, const char *device)
 		DBG(CXT, ul_debugobj(lc, "closing old open fd"));
 	}
 	lc->fd = -1;
-	lc->mode = 0;
+	lc->mode = O_RDONLY;
 	lc->blocksize = 0;
 	lc->has_info = 0;
 	lc->info_failed = 0;
@@ -144,12 +164,6 @@ int loopcxt_has_device(struct loopdev_cxt *lc)
  *	* LOOPDEV_FL_* flags control loopcxt_* API behavior
  *
  *	* LO_FLAGS_* are kernel flags used for LOOP_{SET,GET}_STAT64 ioctls
- *
- * Note about LOOPDEV_FL_{RDONLY,RDWR} flags. These flags are used for open(2)
- * syscall to open loop device. By default is the device open read-only.
- *
- * The exception is loopcxt_setup_device(), where the device is open read-write
- * if LO_FLAGS_READ_ONLY flags is not set (see loopcxt_set_flags()).
  *
  * Returns: <0 on error, 0 on success.
  */
@@ -265,28 +279,50 @@ static struct path_cxt *loopcxt_get_sysfs(struct loopdev_cxt *lc)
 	return lc->sysfs;
 }
 
-/*
- * @lc: context
- *
- * Returns: file descriptor to the open loop device or <0 on error. The mode
- *          depends on LOOPDEV_FL_{RDWR,RDONLY} context flags. Default is
- *          read-only.
- */
-int loopcxt_get_fd(struct loopdev_cxt *lc)
+static int __loopcxt_get_fd(struct loopdev_cxt *lc, mode_t mode)
 {
+	int old = -1;
+
 	if (!lc || !*lc->device)
 		return -EINVAL;
 
+	/* It's okay to return a FD with read-write permissions if someone
+	 * asked for read-only, but you shouldn't do the opposite.
+	 *
+	 * (O_RDONLY is a widely usable default.)
+	 */
+	if (lc->fd >= 0 && mode == O_RDWR && lc->mode == O_RDONLY) {
+		DBG(CXT, ul_debugobj(lc, "closing already open device (mode mismatch)"));
+		old = lc->fd;
+		lc->fd = -1;
+	}
+
 	if (lc->fd < 0) {
-		lc->mode = lc->flags & LOOPDEV_FL_RDWR ? O_RDWR : O_RDONLY;
+		lc->mode = mode;
 		lc->fd = open(lc->device, lc->mode | O_CLOEXEC);
 		DBG(CXT, ul_debugobj(lc, "open %s [%s]: %m", lc->device,
-				lc->flags & LOOPDEV_FL_RDWR ? "rw" : "ro"));
+				mode == O_RDONLY ? "ro" :
+			        mode == O_RDWR ? "rw" : "??"));
+
+		if (lc->fd < 0 && old >= 0) {
+			/* restore original on error */
+			lc->fd = old;
+			old = -1;
+		}
 	}
+
+	if (old >= 0)
+		close(old);
 	return lc->fd;
 }
 
-int loopcxt_set_fd(struct loopdev_cxt *lc, int fd, int mode)
+/* default is read-only file descriptor, it's enough for all ioctls */
+int loopcxt_get_fd(struct loopdev_cxt *lc)
+{
+	return __loopcxt_get_fd(lc, O_RDONLY);
+}
+
+int loopcxt_set_fd(struct loopdev_cxt *lc, int fd, mode_t mode)
 {
 	if (!lc)
 		return -EINVAL;
@@ -560,7 +596,7 @@ static int loopcxt_next_from_sysfs(struct loopdev_cxt *lc)
 /*
  * @lc: context, has to initialized by loopcxt_init_iterator()
  *
- * Returns: 0 on success, -1 on error, 1 at the end of scanning. The details
+ * Returns: 0 on success, < 0 on error, 1 at the end of scanning. The details
  *          about the current loop device are available by
  *          loopcxt_get_{fd,backing_file,device,offset, ...} functions.
  */
@@ -729,6 +765,26 @@ char *loopcxt_get_backing_file(struct loopdev_cxt *lc)
 
 /*
  * @lc: context
+ *
+ * Returns (allocated) string with loop reference. The same as backing file by
+ * default.
+ */
+char *loopcxt_get_refname(struct loopdev_cxt *lc)
+{
+	char *res = NULL;
+	struct loop_info64 *lo = loopcxt_get_info(lc);
+
+	if (lo) {
+		lo->lo_file_name[LO_NAME_SIZE - 1] = '\0';
+		res = strdup((char *) lo->lo_file_name);
+	}
+
+	DBG(CXT, ul_debugobj(lc, "get_refname [%s]", res));
+	return res;
+}
+
+/*
+ * @lc: context
  * @offset: returns offset number for the given device
  *
  * Returns: <0 on error, 0 on success
@@ -739,7 +795,8 @@ int loopcxt_get_offset(struct loopdev_cxt *lc, uint64_t *offset)
 	int rc = -EINVAL;
 
 	if (sysfs)
-		rc = ul_path_read_u64(sysfs, offset, "loop/offset");
+		if (ul_path_read_u64(sysfs, offset, "loop/offset") == 0)
+			rc = 0;
 
 	if (rc && loopcxt_ioctl_enabled(lc)) {
 		struct loop_info64 *lo = loopcxt_get_info(lc);
@@ -767,7 +824,8 @@ int loopcxt_get_blocksize(struct loopdev_cxt *lc, uint64_t *blocksize)
 	int rc = -EINVAL;
 
 	if (sysfs)
-		rc = ul_path_read_u64(sysfs, blocksize, "queue/logical_block_size");
+		if (ul_path_read_u64(sysfs, blocksize, "queue/logical_block_size") == 0)
+			rc = 0;
 
 	/* Fallback based on BLKSSZGET ioctl */
 	if (rc) {
@@ -799,7 +857,8 @@ int loopcxt_get_sizelimit(struct loopdev_cxt *lc, uint64_t *size)
 	int rc = -EINVAL;
 
 	if (sysfs)
-		rc = ul_path_read_u64(sysfs, size, "loop/sizelimit");
+		if (ul_path_read_u64(sysfs, size, "loop/sizelimit") == 0)
+			rc = 0;
 
 	if (rc && loopcxt_ioctl_enabled(lc)) {
 		struct loop_info64 *lo = loopcxt_get_info(lc);
@@ -1159,6 +1218,28 @@ int loopcxt_set_flags(struct loopdev_cxt *lc, uint32_t flags)
 
 /*
  * @lc: context
+ * @refname: reference name (used to overwrite lo_file_name where is backing
+ *           file by default)
+ *
+ * The setting is removed by loopcxt_set_device() loopcxt_next()!
+ *
+ * Returns: 0 on success, <0 on error.
+ */
+int loopcxt_set_refname(struct loopdev_cxt *lc, const char *refname)
+{
+	if (!lc)
+		return -EINVAL;
+
+	memset(lc->config.info.lo_file_name, 0, sizeof(lc->config.info.lo_file_name));
+	if (refname)
+		xstrncpy((char *)lc->config.info.lo_file_name, refname, LO_NAME_SIZE);
+
+	DBG(CXT, ul_debugobj(lc, "set refname=%s", (char *)lc->config.info.lo_file_name));
+	return 0;
+}
+
+/*
+ * @lc: context
  * @filename: backing file path (the path will be canonicalized)
  *
  * The setting is removed by loopcxt_set_device() loopcxt_next()!
@@ -1174,9 +1255,10 @@ int loopcxt_set_backing_file(struct loopdev_cxt *lc, const char *filename)
 	if (!lc->filename)
 		return -errno;
 
-	xstrncpy((char *)lc->config.info.lo_file_name, lc->filename, LO_NAME_SIZE);
+	if (!lc->config.info.lo_file_name[0])
+		loopcxt_set_refname(lc, lc->filename);
 
-	DBG(CXT, ul_debugobj(lc, "set backing file=%s", lc->config.info.lo_file_name));
+	DBG(CXT, ul_debugobj(lc, "set backing file=%s", lc->filename));
 	return 0;
 }
 
@@ -1270,6 +1352,7 @@ static int loopcxt_check_size(struct loopdev_cxt *lc, int file_fd)
 	return 0;
 }
 
+
 /*
  * @lc: context
  *
@@ -1290,7 +1373,9 @@ static int loopcxt_check_size(struct loopdev_cxt *lc, int file_fd)
  */
 int loopcxt_setup_device(struct loopdev_cxt *lc)
 {
-	int file_fd, dev_fd, mode = O_RDWR, rc = -1, cnt = 0, err, again;
+	int file_fd, dev_fd;
+	mode_t flags = O_CLOEXEC, mode = O_RDWR;
+	int rc = -1, cnt = 0;
 	int errsv = 0;
 	int fallback = 0;
 
@@ -1305,9 +1390,12 @@ int loopcxt_setup_device(struct loopdev_cxt *lc)
 	if (lc->config.info.lo_flags & LO_FLAGS_READ_ONLY)
 		mode = O_RDONLY;
 
-	if ((file_fd = open(lc->filename, mode | O_CLOEXEC)) < 0) {
+	if (lc->config.info.lo_flags & LO_FLAGS_DIRECT_IO)
+		flags |= O_DIRECT;
+
+	if ((file_fd = open(lc->filename, mode | flags)) < 0) {
 		if (mode != O_RDONLY && (errno == EROFS || errno == EACCES))
-			file_fd = open(lc->filename, mode = O_RDONLY);
+			file_fd = open(lc->filename, (mode = O_RDONLY) | flags);
 
 		if (file_fd < 0) {
 			DBG(SETUP, ul_debugobj(lc, "open backing file failed: %m"));
@@ -1316,25 +1404,22 @@ int loopcxt_setup_device(struct loopdev_cxt *lc)
 	}
 	DBG(SETUP, ul_debugobj(lc, "backing file open: OK"));
 
-	if (lc->fd != -1 && lc->mode != mode) {
-		DBG(SETUP, ul_debugobj(lc, "closing already open device (mode mismatch)"));
-		close(lc->fd);
-		lc->fd = -1;
-		lc->mode = 0;
-	}
-
-	if (mode == O_RDONLY) {
-		lc->flags |= LOOPDEV_FL_RDONLY;			/* open() mode */
+	if (mode == O_RDONLY)
 		lc->config.info.lo_flags |= LO_FLAGS_READ_ONLY;	/* kernel loopdev mode */
-	} else {
-		lc->flags |= LOOPDEV_FL_RDWR;			/* open() mode */
+	else
 		lc->config.info.lo_flags &= ~LO_FLAGS_READ_ONLY;
-		lc->flags &= ~LOOPDEV_FL_RDONLY;
-	}
 
 	do {
 		errno = 0;
-		dev_fd = loopcxt_get_fd(lc);
+
+		/* For the ioctls, it's enough to use O_RDONLY, but udevd
+		 * monitor devices by inotify, and udevd needs IN_CLOSE_WRITE
+		 * event to trigger probing of the new device.
+		 *
+		 * The mode used for the device does not have to match the mode
+		 * used for the backing file.
+		 */
+		dev_fd = __loopcxt_get_fd(lc, O_RDWR);
 		if (dev_fd >= 0 || lc->control_ok == 0)
 			break;
 		if (errno != EACCES && errno != ENOENT)
@@ -1357,20 +1442,18 @@ int loopcxt_setup_device(struct loopdev_cxt *lc)
 	 * -- since Linux v5.8-rc1, commit 3448914e8cc550ba792d4ccc74471d1ca4293aae
 	 */
 	lc->config.fd = file_fd;
-	if (ioctl(dev_fd, LOOP_CONFIGURE, &lc->config) < 0) {
-		rc = -errno;
+	if (lc->blocksize > 0)
+		lc->config.block_size = lc->blocksize;
+
+	rc = repeat_on_eagain( ioctl(dev_fd, LOOP_CONFIGURE, &lc->config) );
+	if (rc != 0) {
 		errsv = errno;
-		if (errno != EINVAL) {
+		if (errno != EINVAL && errno != ENOTTY && errno != ENOSYS) {
 			DBG(SETUP, ul_debugobj(lc, "LOOP_CONFIGURE failed: %m"));
 			goto err;
 		}
 		fallback = 1;
 	} else {
-		if (lc->blocksize > 0
-			&& (rc = loopcxt_ioctl_blocksize(lc, lc->blocksize)) < 0) {
-			errsv = -rc;
-			goto err;
-		}
 		DBG(SETUP, ul_debugobj(lc, "LOOP_CONFIGURE: OK"));
 	}
 
@@ -1394,21 +1477,10 @@ int loopcxt_setup_device(struct loopdev_cxt *lc)
 			goto err;
 		}
 
-		do {
-			err = ioctl(dev_fd, LOOP_SET_STATUS64, &lc->config.info);
-			again = err && errno == EAGAIN;
-			if (again)
-				xusleep(250000);
-		} while (again);
-
-		if (err) {
-			rc = -errno;
-			errsv = errno;
-			DBG(SETUP, ul_debugobj(lc, "LOOP_SET_STATUS64 failed: %m"));
+		if ((rc = loopcxt_ioctl_status(lc)) < 0) {
+			errsv = -rc;
 			goto err;
 		}
-
-		DBG(SETUP, ul_debugobj(lc, "LOOP_SET_STATUS64: OK"));
 	}
 
 	if ((rc = loopcxt_check_size(lc, file_fd)))
@@ -1434,6 +1506,7 @@ err:
 	return rc;
 }
 
+
 /*
  * @lc: context
  *
@@ -1447,25 +1520,18 @@ err:
  */
 int loopcxt_ioctl_status(struct loopdev_cxt *lc)
 {
-	int dev_fd, rc = -1, err, again;
+	int dev_fd, rc;
 
 	errno = 0;
 	dev_fd = loopcxt_get_fd(lc);
 
-	if (dev_fd < 0) {
-		rc = -errno;
-		return rc;
-	}
-	DBG(SETUP, ul_debugobj(lc, "device open: OK"));
+	if (dev_fd < 0)
+		return -errno;
 
-	do {
-		err = ioctl(dev_fd, LOOP_SET_STATUS64, &lc->config.info);
-		again = err && errno == EAGAIN;
-		if (again)
-			xusleep(250000);
-	} while (again);
-	if (err) {
-		rc = -errno;
+	DBG(SETUP, ul_debugobj(lc, "calling LOOP_SET_STATUS64"));
+
+	rc = repeat_on_eagain( ioctl(dev_fd, LOOP_SET_STATUS64, &lc->config.info) );
+	if (rc != 0) {
 		DBG(SETUP, ul_debugobj(lc, "LOOP_SET_STATUS64 failed: %m"));
 		return rc;
 	}
@@ -1476,14 +1542,16 @@ int loopcxt_ioctl_status(struct loopdev_cxt *lc)
 
 int loopcxt_ioctl_capacity(struct loopdev_cxt *lc)
 {
-	int fd = loopcxt_get_fd(lc);
+	int rc, fd = loopcxt_get_fd(lc);
 
 	if (fd < 0)
 		return -EINVAL;
 
+	DBG(SETUP, ul_debugobj(lc, "calling LOOP_SET_CAPACITY"));
+
 	/* Kernels prior to v2.6.30 don't support this ioctl */
-	if (ioctl(fd, LOOP_SET_CAPACITY, 0) < 0) {
-		int rc = -errno;
+	rc = repeat_on_eagain( ioctl(fd, LOOP_SET_CAPACITY, 0) );
+	if (rc != 0) {
 		DBG(CXT, ul_debugobj(lc, "LOOP_SET_CAPACITY failed: %m"));
 		return rc;
 	}
@@ -1494,14 +1562,16 @@ int loopcxt_ioctl_capacity(struct loopdev_cxt *lc)
 
 int loopcxt_ioctl_dio(struct loopdev_cxt *lc, unsigned long use_dio)
 {
-	int fd = loopcxt_get_fd(lc);
+	int rc, fd = loopcxt_get_fd(lc);
 
 	if (fd < 0)
 		return -EINVAL;
 
+	DBG(SETUP, ul_debugobj(lc, "calling LOOP_SET_DIRECT_IO"));
+
 	/* Kernels prior to v4.4 don't support this ioctl */
-	if (ioctl(fd, LOOP_SET_DIRECT_IO, use_dio) < 0) {
-		int rc = -errno;
+	rc = repeat_on_eagain( ioctl(fd, LOOP_SET_DIRECT_IO, use_dio) );
+	if (rc != 0) {
 		DBG(CXT, ul_debugobj(lc, "LOOP_SET_DIRECT_IO failed: %m"));
 		return rc;
 	}
@@ -1516,14 +1586,16 @@ int loopcxt_ioctl_dio(struct loopdev_cxt *lc, unsigned long use_dio)
  */
 int loopcxt_ioctl_blocksize(struct loopdev_cxt *lc, uint64_t blocksize)
 {
-	int fd = loopcxt_get_fd(lc);
+	int rc, fd = loopcxt_get_fd(lc);
 
 	if (fd < 0)
 		return -EINVAL;
 
-	/* Kernels prior to v4.14 don't support this ioctl */
-	if (ioctl(fd, LOOP_SET_BLOCK_SIZE, (unsigned long) blocksize) < 0) {
-		int rc = -errno;
+	DBG(SETUP, ul_debugobj(lc, "calling LOOP_SET_BLOCK_SIZE"));
+
+	rc = repeat_on_eagain(
+		ioctl(fd, LOOP_SET_BLOCK_SIZE, (unsigned long) blocksize) );
+	if (rc != 0) {
 		DBG(CXT, ul_debugobj(lc, "LOOP_SET_BLOCK_SIZE failed: %m"));
 		return rc;
 	}
@@ -1534,14 +1606,17 @@ int loopcxt_ioctl_blocksize(struct loopdev_cxt *lc, uint64_t blocksize)
 
 int loopcxt_delete_device(struct loopdev_cxt *lc)
 {
-	int fd = loopcxt_get_fd(lc);
+	int rc, fd = loopcxt_get_fd(lc);
 
 	if (fd < 0)
 		return -EINVAL;
 
-	if (ioctl(fd, LOOP_CLR_FD, 0) < 0) {
+	DBG(SETUP, ul_debugobj(lc, "calling LOOP_SET_CLR_FD"));
+
+	rc = repeat_on_eagain( ioctl(fd, LOOP_CLR_FD, 0) );
+	if (rc != 0) {
 		DBG(CXT, ul_debugobj(lc, "LOOP_CLR_FD failed: %m"));
-		return -errno;
+		return rc;
 	}
 
 	DBG(CXT, ul_debugobj(lc, "device removed"));
@@ -1584,6 +1659,8 @@ done:
  * kernels we have to check all loop devices to found unused one.
  *
  * See kernel commit 770fe30a46a12b6fb6b63fbe1737654d28e8484.
+ *
+ * Returns: 0 = success, < 0 error
  */
 int loopcxt_find_unused(struct loopdev_cxt *lc)
 {
@@ -1599,6 +1676,8 @@ int loopcxt_find_unused(struct loopdev_cxt *lc)
 		ctl = open(_PATH_DEV_LOOPCTL, O_RDWR|O_CLOEXEC);
 		if (ctl >= 0)
 			rc = ioctl(ctl, LOOP_CTL_GET_FREE);
+		else
+			rc = -errno;
 		if (rc >= 0) {
 			char name[16];
 			snprintf(name, sizeof(name), "loop%d", rc);
@@ -1620,6 +1699,8 @@ int loopcxt_find_unused(struct loopdev_cxt *lc)
 		rc = loopcxt_next(lc);
 		loopcxt_deinit_iterator(lc);
 		DBG(CXT, ul_debugobj(lc, "find_unused by scan [rc=%d]", rc));
+		if (rc)
+			return -ENOENT;
 	}
 	return rc;
 }
@@ -1663,6 +1744,9 @@ char *loopdev_get_backing_file(const char *device)
 	return res;
 }
 
+/*
+ * Returns: TRUE/FALSE
+ */
 int loopdev_has_backing_file(const char *device)
 {
 	char *tmp = loopdev_get_backing_file(device);
@@ -1700,6 +1784,9 @@ int loopdev_is_used(const char *device, const char *filename,
 	return rc;
 }
 
+/*
+ * Returns: 0 = success, < 0 error
+ */
 int loopdev_delete(const char *device)
 {
 	struct loopdev_cxt lc;
@@ -1770,10 +1857,13 @@ int loopcxt_find_overlap(struct loopdev_cxt *lc, const char *filename,
 
 		rc = loopcxt_is_used(lc, hasst ? &st : NULL,
 				     filename, offset, sizelimit, 0);
-		if (!rc)
-			continue;	/* unused */
-		if (rc < 0)
-			break;		/* error */
+		/*
+		 * Either the loopdev is unused or we've got an error which can
+		 * happen when we are racing with device autoclear. Just ignore
+		 * this loopdev...
+		 */
+		if (rc <= 0)
+			continue;
 
 		DBG(CXT, ul_debugobj(lc, "found %s backed by %s",
 			loopcxt_get_device(lc), filename));
@@ -1782,13 +1872,13 @@ int loopcxt_find_overlap(struct loopdev_cxt *lc, const char *filename,
 		if (rc) {
 			DBG(CXT, ul_debugobj(lc, "failed to get offset for device %s",
 				loopcxt_get_device(lc)));
-			break;
+			continue;
 		}
 		rc = loopcxt_get_sizelimit(lc, &lc_sizelimit);
 		if (rc) {
 			DBG(CXT, ul_debugobj(lc, "failed to get sizelimit for device %s",
 				loopcxt_get_device(lc)));
-			break;
+			continue;
 		}
 
 		/* full match */

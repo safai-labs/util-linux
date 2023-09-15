@@ -1,5 +1,8 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
  * Copyright (C) 2010 Davidlohr Bueso <dave@gnu.org>
+ * Copyright (C) 2010-2022 Karel Zak <kzak@redhat.com>
  *
  * This file may be redistributed under the terms of the
  * GNU Lesser General Public License.
@@ -18,15 +21,6 @@
 #ifndef XALLOC_EXIT_CODE
 # define XALLOC_EXIT_CODE EXIT_FAILURE
 #endif
-
-static inline
-__attribute__((__noreturn__))
-void __err_oom(const char *file, unsigned int line)
-{
-	err(XALLOC_EXIT_CODE, "%s: %u: cannot allocate memory", file, line);
-}
-
-#define err_oom()	__err_oom(__FILE__, __LINE__)
 
 static inline
 __ul_alloc_size(1)
@@ -48,6 +42,18 @@ void *xrealloc(void *ptr, const size_t size)
 	void *ret = realloc(ptr, size);
 
 	if (!ret && size)
+		err(XALLOC_EXIT_CODE, "cannot allocate %zu bytes", size);
+	return ret;
+}
+
+static inline
+__ul_calloc_size(2, 3)
+__ul_returns_nonnull
+void *xreallocarray(void *ptr, const size_t nelems, const size_t size)
+{
+	void *ret = reallocarray(ptr, nelems, size);
+
+	if (!ret && size && nelems)
 		err(XALLOC_EXIT_CODE, "cannot allocate %zu bytes", size);
 	return ret;
 }

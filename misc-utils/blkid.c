@@ -46,6 +46,8 @@
 #define XALLOC_EXIT_CODE    BLKID_EXIT_OTHER    /* x.*alloc(), xstrndup() */
 #include "xalloc.h"
 
+#include "sysfs.h"
+
 struct blkid_control {
 	int output;
 	uintmax_t offset;
@@ -400,14 +402,11 @@ static int append_str(char **res, size_t *sz, const char *a, const char *b)
 	*res = str = xrealloc(str, len + 1);
 	str += *sz;
 
-	if (a) {
-		memcpy(str, a, asz);
-		str += asz;
-	}
-	if (b) {
-		memcpy(str, b, bsz);
-		str += bsz;
-	}
+	if (a)
+		str = mempcpy(str, a, asz);
+	if (b)
+		str = mempcpy(str, b, bsz);
+
 	*str = '\0';
 	*sz = len;
 	return 0;
@@ -836,8 +835,35 @@ int main(int argc, char **argv)
 	/* The rest of the args are device names */
 	if (optind < argc) {
 		devices = xcalloc(argc - optind, sizeof(char *));
-		while (optind < argc)
-			devices[numdev++] = argv[optind++];
+		while (optind < argc) {
+			char *dev = argv[optind++];
+			struct stat sb;
+
+			if (stat(dev, &sb) != 0)
+				continue;
+			else if (S_ISBLK(sb.st_mode))
+				;
+			else if (S_ISREG(sb.st_mode))
+				;
+			else if (S_ISCHR(sb.st_mode)) {
+				char buf[PATH_MAX];
+
+				if (!sysfs_chrdev_devno_to_devname(
+						sb.st_rdev, buf, sizeof(buf)))
+					continue;
+				if (strncmp(buf, "ubi", 3) != 0)
+					continue;
+			} else
+				continue;
+
+			devices[numdev++] = dev;
+		}
+
+		if (!numdev) {
+			/* only unsupported devices specified */
+			err = BLKID_EXIT_NOTFOUND;
+			goto exit;
+		}
 	}
 
 	/* convert LABEL/UUID lookup to evaluate request */
@@ -892,8 +918,8 @@ int main(int argc, char **argv)
 			blkid_probe_set_superblocks_flags(pr,
 				BLKID_SUBLKS_LABEL | BLKID_SUBLKS_UUID |
 				BLKID_SUBLKS_TYPE | BLKID_SUBLKS_SECTYPE |
-				BLKID_SUBLKS_USAGE | BLKID_SUBLKS_VERSION);
-
+				BLKID_SUBLKS_USAGE | BLKID_SUBLKS_VERSION |
+				BLKID_SUBLKS_FSINFO);
 
 			if (fltr_usage &&
 			    blkid_probe_filter_superblocks_usage(pr, fltr_flag, fltr_usage))

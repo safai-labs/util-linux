@@ -108,7 +108,7 @@ static void tcinit(struct console *con)
 	struct termios *tio = &con->tio;
 	const int fd = con->fd;
 #if defined(TIOCGSERIAL)
-	struct serial_struct serinfo;
+	struct serial_struct serinfo = { .flags = 0 };
 #endif
 #ifdef USE_PLYMOUTH_SUPPORT
 	struct termios lock;
@@ -132,18 +132,18 @@ static void tcinit(struct console *con)
 	errno = 0;
 #endif
 
-#if defined(TIOCGSERIAL)
+#ifdef TIOCGSERIAL
 	if (ioctl(fd, TIOCGSERIAL,  &serinfo) >= 0)
 		con->flags |= CON_SERIAL;
 	errno = 0;
-#else
-# if defined(KDGKBMODE)
-	if (ioctl(fd, KDGKBMODE, &mode) < 0)
-		con->flags |= CON_SERIAL;
-	errno = 0;
-# endif
 #endif
 
+#ifdef KDGKBMODE
+	if (!(con->flags & CON_SERIAL)
+	    && ioctl(fd, KDGKBMODE, &mode) < 0)
+		con->flags |= CON_SERIAL;
+	errno = 0;
+#endif
 	if (tcgetattr(fd, tio) < 0) {
 		int saveno = errno;
 #if defined(KDGKBMODE) || defined(TIOCGSERIAL)
@@ -270,23 +270,21 @@ static void tcfinal(struct console *con)
 {
 	struct termios *tio = &con->tio;
 	const int fd = con->fd;
+	char *term, *ttyname = NULL;
 
-	if (con->flags & CON_EIO)
-		return;
-	if ((con->flags & CON_SERIAL) == 0) {
-		xsetenv("TERM", "linux", 1);
-		return;
-	}
-	if (con->flags & CON_NOTTY) {
-		xsetenv("TERM", "dumb", 1);
-		return;
+	if (con->tty)
+		ttyname = strncmp(con->tty, "/dev/", 5) == 0 ?
+					con->tty + 5 : con->tty;
+
+	term = get_terminal_default_type(ttyname, con->flags & CON_SERIAL);
+	if (term) {
+		xsetenv("TERM", term, 0);
+		free(term);
 	}
 
-#if defined (__s390__) || defined (__s390x__)
-	xsetenv("TERM", "dumb", 1);
-#else
-	xsetenv("TERM", "vt102", 1);
-#endif
+	if (!(con->flags & CON_SERIAL) || (con->flags & CON_NOTTY))
+		return;
+
 	tio->c_iflag |= (IXON | IXOFF);
 	tio->c_lflag |= (ICANON | ISIG | ECHO|ECHOE|ECHOK|ECHOKE);
 	tio->c_oflag |= OPOST;
@@ -342,12 +340,12 @@ static void tcfinal(struct console *con)
 static void alrm_handler(int sig __attribute__((unused)))
 {
 	/* Timeout expired */
-	alarm_rised++;
+	alarm_rised = 1;
 }
 
 static void chld_handler(int sig __attribute__((unused)))
 {
-	sigchild++;
+	sigchild = 1;
 }
 
 static void mask_signal(int signal, void (*handler)(int),
@@ -698,7 +696,10 @@ static char *getpasswd(struct console *con)
 	cp->eol = *ptr = '\0';
 
 	eightbit = ((con->flags & CON_SERIAL) == 0 || (tty.c_cflag & (PARODD|PARENB)) == 0);
+
 	while (cp->eol == '\0') {
+		errno = 0;
+
 		if (read(fd, &c, 1) < 1) {
 			if (errno == EINTR || errno == EAGAIN) {
 				if (alarm_rised) {
@@ -709,16 +710,15 @@ static char *getpasswd(struct console *con)
 				continue;
 			}
 			ret = NULL;
+
 			switch (errno) {
 			case EIO:
 				con->flags |= CON_EIO;
-			case ESRCH:
-			case EINVAL:
-			case ENOENT:
-			case 0:
-				break;
+				/* fallthrough */
 			default:
 				warn(_("cannot read %s"), con->tty);
+				break;
+			case 0:
 				break;
 			}
 			goto quit;
@@ -942,7 +942,15 @@ int main(int argc, char **argv)
 			opt_e = 1;
 			break;
 		case 'V':
-			print_version(EXIT_SUCCESS);
+		{
+			static const char *features[] = {
+#ifdef USE_SULOGIN_EMERGENCY_MOUNT
+				"emergency-mount",
+#endif
+				NULL
+			};
+			print_version_with_features(EXIT_SUCCESS, features);
+		}
 		case 'h':
 			usage();
 		default:

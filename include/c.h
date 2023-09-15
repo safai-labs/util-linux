@@ -159,6 +159,14 @@
 	_max1 > _max2 ? _max1 : _max2; })
 #endif
 
+#ifndef abs_diff
+# define abs_diff(x, y) __extension__ ({        \
+	__typeof__(x) _a = (x);			\
+	__typeof__(y) _b = (y);			\
+	(void) (&_a == &_b);			\
+	_a > _b ? _a - _b : _b - _a; })
+#endif
+
 #ifndef cmp_numbers
 # define cmp_numbers(x, y) __extension__ ({	\
 	__typeof__(x) _a = (x);			\
@@ -167,8 +175,30 @@
 	_a == _b ? 0 : _a > _b ? 1 : -1; })
 #endif
 
+
+#ifndef cmp_timespec
+# define cmp_timespec(a, b, CMP)		\
+	(((a)->tv_sec == (b)->tv_sec)		\
+	? ((a)->tv_nsec CMP (b)->tv_nsec)	\
+	: ((a)->tv_sec CMP (b)->tv_sec))
+#endif
+
+
+#ifndef cmp_stat_mtime
+# ifdef HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC
+#  define cmp_stat_mtime(_a, _b, CMP)	cmp_timespec(&(_a)->st_mtim, &(_b)->st_mtim, CMP)
+# else
+#  define cmp_stat_mtime(_a, _b, CMP)	((_a)->st_mtime CMP (_b)->st_mtime)
+# endif
+#endif
+
+
 #ifndef offsetof
 #define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+#endif
+
+#ifndef sizeof_member
+#define sizeof_member(TYPE, MEMBER) sizeof(((TYPE *)0)->MEMBER)
 #endif
 
 /*
@@ -256,6 +286,18 @@ errmsg(char doexit, int excode, char adderr, const char *fmt, ...)
 #endif /* !HAVE_ERR_H */
 
 
+static inline
+__attribute__((__noreturn__))
+void __err_oom(const char *file, unsigned int line)
+{
+	err(EXIT_FAILURE, "%s: %u: cannot allocate memory", file, line);
+}
+#define err_oom()	__err_oom(__FILE__, __LINE__)
+
+#define err_nosys(exitcode, ...) \
+	err(errno == ENOSYS ? EXIT_NOTSUPP : exitcode, __VA_ARGS__)
+
+
 /* Don't use inline function to avoid '#include "nls.h"' in c.h
  */
 #define errtryhelp(eval) __extension__ ({ \
@@ -270,7 +312,6 @@ errmsg(char doexit, int excode, char adderr, const char *fmt, ...)
 #define errexec(name)	err(errno == ENOENT ? EX_EXEC_ENOENT : EX_EXEC_FAILED, \
 			_("failed to execute %s"), name)
 
-
 static inline __attribute__((const)) int is_power_of_2(unsigned long num)
 {
 	return (num != 0 && ((num & (num - 1)) == 0));
@@ -280,8 +321,9 @@ static inline __attribute__((const)) int is_power_of_2(unsigned long num)
 typedef int64_t loff_t;
 #endif
 
-#if !defined(HAVE_DIRFD) && (!defined(HAVE_DECL_DIRFD) || HAVE_DECL_DIRFD == 0) && defined(HAVE_DIR_DD_FD)
-#include <sys/types.h>
+#if !defined(HAVE_DIRFD) \
+    && (!defined(HAVE_DECL_DIRFD) || HAVE_DECL_DIRFD == 0) \
+    && defined(HAVE_DIR_DD_FD)
 #include <dirent.h>
 static inline int dirfd(DIR *d)
 {
@@ -342,10 +384,6 @@ static inline int drop_permissions(void)
 {
 	errno = 0;
 
-	/* drop supplementary groups */
-	if (setgroups(0, NULL) != 0)
-		goto fail;
-
 	/* drop GID */
 	if (setgid(getgid()) < 0)
 		goto fail;
@@ -381,6 +419,29 @@ static inline int xusleep(useconds_t usec)
 #endif
 }
 
+
+#define ul_err_write(_m) ignore_result( write(STDERR_FILENO, _m, strlen(_m)) )
+
+/*
+ * warn() for signal handlers
+ */
+static inline void ul_sig_warn(const char *mesg)
+{
+	ul_err_write(program_invocation_short_name);
+	ul_err_write(": ");
+	ul_err_write(mesg);
+	ul_err_write("\n");
+}
+
+/*
+ * err() for signal handlers
+ */
+static inline void __attribute__((__noreturn__)) ul_sig_err(int excode, const char *mesg)
+{
+	ul_sig_warn(mesg);
+	_exit(excode);
+}
+
 /*
  * Constant strings for usage() functions. For more info see
  * Documentation/{howto-usage-function.txt,boilerplate.c}
@@ -391,6 +452,7 @@ static inline int xusleep(useconds_t usec)
 #define USAGE_COMMANDS   _("\nCommands:\n")
 #define USAGE_ARGUMENTS   _("\nArguments:\n")
 #define USAGE_COLUMNS    _("\nAvailable output columns:\n")
+#define USAGE_DEFAULT_COLUMNS _("\nDefault columns:\n")
 #define USAGE_SEPARATOR    "\n"
 
 #define USAGE_OPTSTR_HELP     _("display this help")
@@ -413,6 +475,30 @@ static inline int xusleep(useconds_t usec)
 
 #define print_version(eval) __extension__ ({ \
 		printf(UTIL_LINUX_VERSION); \
+		exit(eval); \
+})
+
+static inline void print_features(const char **features, const char *prefix)
+{
+	if (features && *features) {
+		const char **p = features;
+		while (p && *p) {
+			if (prefix && p == features)
+				printf(" (%s ", prefix);
+			else
+				fputs(p == features ? " (" : ", ", stdout);
+			fputs(*p++, stdout);
+		}
+		fputc(')', stdout);
+	}
+}
+
+#define UTIL_LINUX_VERSION_NOBREAK _("%s from %s"), program_invocation_short_name, PACKAGE_STRING
+
+#define print_version_with_features(eval, features) __extension__ ({ \
+		printf(UTIL_LINUX_VERSION_NOBREAK); \
+		print_features(features, _("features:")); \
+		fputc('\n', stdout); \
 		exit(eval); \
 })
 
@@ -479,5 +565,7 @@ static inline int xusleep(useconds_t usec)
 #if !defined MAP_ANONYMOUS && defined MAP_ANON
 # define MAP_ANONYMOUS  (MAP_ANON)
 #endif
+
+#define SINT_MAX(t) (((t)1 << (sizeof(t) * 8 - 2)) - (t)1 + ((t)1 << (sizeof(t) * 8 - 2)))
 
 #endif /* UTIL_LINUX_C_H */

@@ -806,7 +806,7 @@ static fdisk_sector_t get_dev_blocks(char *dev)
 	int fd, ret;
 	fdisk_sector_t size;
 
-	if ((fd = open(dev, O_RDONLY)) < 0)
+	if ((fd = open(dev, O_RDONLY|O_NONBLOCK)) < 0)
 		err(EXIT_FAILURE, _("cannot open %s"), dev);
 	ret = blkdev_get_sectors(fd, (unsigned long long *) &size);
 	close(fd);
@@ -928,7 +928,7 @@ int main(int argc, char **argv)
 		{ "type",           required_argument, NULL, 't' },
 		{ "units",          optional_argument, NULL, 'u' },
 		{ "version",        no_argument,       NULL, 'V' },
-		{ "output",         no_argument,       NULL, 'o' },
+		{ "output",         required_argument, NULL, 'o' },
 		{ "protect-boot",   no_argument,       NULL, 'B' },
 		{ "wipe",           required_argument, NULL, 'w' },
 		{ "wipe-partitions",required_argument, NULL, 'W' },

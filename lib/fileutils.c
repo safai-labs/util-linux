@@ -77,7 +77,11 @@ int xmkstemp(char **tmpname, const char *dir, const char *prefix)
 	return fd;
 }
 
+#ifdef F_DUPFD_CLOEXEC
 int dup_fd_cloexec(int oldfd, int lowfd)
+#else
+int dup_fd_cloexec(int oldfd, int lowfd  __attribute__((__unused__)))
+#endif
 {
 	int fd, flags, errno_save;
 
@@ -287,4 +291,23 @@ int ul_copy_file(int from, int to)
 #else
 	return copy_file_simple(from, to);
 #endif
+}
+
+int ul_reopen(int fd, int flags)
+{
+	ssize_t ssz;
+	char buf[PATH_MAX];
+	char fdpath[ sizeof(_PATH_PROC_FDDIR) + sizeof(stringify_value(INT_MAX)) ];
+
+	snprintf(fdpath, sizeof(fdpath), _PATH_PROC_FDDIR "/%d", fd);
+
+	ssz = readlink(fdpath, buf, sizeof(buf) - 1);
+	if (ssz < 0)
+		return -errno;
+
+	assert(ssz > 0);
+
+	buf[ssz] = '\0';
+
+	return open(buf, flags);
 }

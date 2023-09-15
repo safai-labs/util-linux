@@ -18,6 +18,7 @@ libcommon_la_SOURCES = \
 	lib/color-names.c \
 	lib/crc32.c \
 	lib/crc32c.c \
+	lib/crc64.c \
 	lib/c_strtod.c \
 	lib/encode.c \
 	lib/env.c \
@@ -29,20 +30,20 @@ libcommon_la_SOURCES = \
 	lib/mbsalign.c \
 	lib/mbsedit.c\
 	lib/md5.c \
-	lib/pager.c \
 	lib/pwdutils.c \
 	lib/randutils.c \
 	lib/sha1.c \
+	lib/sha256.c \
 	lib/signames.c \
 	lib/strutils.c \
 	lib/strv.c \
 	lib/timeutils.c \
-	lib/ttyutils.c
+	lib/ttyutils.c \
+	lib/xxhash.c
 
 if LINUX
 libcommon_la_SOURCES += \
 	lib/linux_version.c \
-	lib/procutils.c \
 	lib/loopdev.c
 endif
 
@@ -58,6 +59,7 @@ if HAVE_OPENAT
 if HAVE_DIRFD
 libcommon_la_SOURCES += lib/path.c
 libcommon_la_SOURCES += lib/sysfs.c
+libcommon_la_SOURCES += lib/procfs.c
 endif
 endif
 
@@ -84,6 +86,7 @@ check_PROGRAMS += \
 	test_buffer \
 	test_canonicalize \
 	test_colors \
+	test_fileeq \
 	test_fileutils \
 	test_ismounted \
 	test_pwdutils \
@@ -93,7 +96,8 @@ check_PROGRAMS += \
 	test_strutils \
 	test_ttyutils \
 	test_timeutils \
-	test_c_strtod
+	test_c_strtod \
+	test_logindefs
 
 
 if LINUX
@@ -102,6 +106,7 @@ check_PROGRAMS += test_cpuset
 endif
 check_PROGRAMS += \
 	test_sysfs \
+	test_procfs \
 	test_pager \
 	test_caputils \
 	test_loopdev \
@@ -110,7 +115,6 @@ endif
 
 if HAVE_OPENAT
 if HAVE_DIRFD
-check_PROGRAMS += test_procutils
 check_PROGRAMS += test_path
 endif
 endif
@@ -149,9 +153,6 @@ test_randutils_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_RANDUTILS
 
 if HAVE_OPENAT
 if HAVE_DIRFD
-test_procutils_SOURCES = lib/procutils.c
-test_procutils_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_PROCUTILS
-
 test_path_SOURCES = lib/path.c lib/fileutils.c
 if HAVE_CPU_SET_T
 test_path_SOURCES += lib/cpuset.c
@@ -174,12 +175,19 @@ if LINUX
 test_cpuset_SOURCES = lib/cpuset.c
 test_cpuset_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_CPUSET
 
-test_sysfs_SOURCES = lib/sysfs.c lib/path.c lib/fileutils.c
+test_sysfs_SOURCES = lib/sysfs.c lib/path.c lib/fileutils.c lib/buffer.c lib/mbsalign.c
 if HAVE_CPU_SET_T
 test_sysfs_SOURCES += lib/cpuset.c
 endif
 test_sysfs_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_SYSFS
 test_sysfs_LDADD = $(LDADD)
+
+test_procfs_SOURCES = lib/procfs.c lib/path.c lib/fileutils.c lib/strutils.c
+if HAVE_CPU_SET_T
+test_procfs_SOURCES += lib/cpuset.c
+endif
+test_procfs_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_PROCFS
+test_procfs_LDADD = $(LDADD)
 
 test_pager_SOURCES = lib/pager.c
 test_pager_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_PAGER
@@ -187,6 +195,9 @@ test_pager_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_PAGER
 test_linux_version_SOURCES = lib/linux_version.c
 test_linux_version_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_LINUXVERSION
 endif
+
+test_fileeq_SOURCES = lib/fileeq.c
+test_fileeq_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_FILEEQ
 
 test_fileutils_SOURCES = lib/fileutils.c
 test_fileutils_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_FILEUTILS
@@ -203,7 +214,7 @@ test_pwdutils_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM
 test_remove_env_SOURCES = lib/env.c
 test_remove_env_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM
 
-test_buffer_SOURCES = lib/buffer.c
+test_buffer_SOURCES = lib/buffer.c lib/mbsalign.c
 test_buffer_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_BUFFER
 
 if LINUX
@@ -213,4 +224,12 @@ test_loopdev_SOURCES = lib/loopdev.c \
 		       $(test_sysfs_SOURCES) \
 		       $(test_canonicalize_SOURCES)
 test_loopdev_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_LOOPDEV
+endif
+
+
+test_logindefs_SOURCES = lib/logindefs.c
+test_logindefs_CPPFLAGS = -DTEST_PROGRAM $(AM_CPPFLAGS)
+test_logindefs_LDADD = $(LDADD) libcommon.la
+if HAVE_ECONF
+test_logindefs_LDADD += -leconf
 endif

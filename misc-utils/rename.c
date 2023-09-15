@@ -37,6 +37,7 @@ for i in $@; do N=`echo "$i" | sed "s/$FROM/$TO/g"`; mv "$i" "$N"; done
 #include "xalloc.h"
 #include "c.h"
 #include "closestream.h"
+#include "optutils.h"
 #include "rpmatch.h"
 
 #define RENAME_EXIT_SOMEOK	2
@@ -44,23 +45,65 @@ for i in $@; do N=`echo "$i" | sed "s/$FROM/$TO/g"`; mv "$i" "$N"; done
 #define RENAME_EXIT_UNEXPLAINED	64
 
 static int tty_cbreak = 0;
+static int all = 0;
+static int last = 0;
 
-static int string_replace(char *from, char *to, char *s, char *orig, char **newname)
+/* Find the first place in `orig` where we'll perform a replacement. NULL if
+   there are no replacements to do. */
+static char *find_initial_replace(char *from, char *to, char *orig)
+{
+	char *search_start = orig;
+
+	if (strchr(from, '/') == NULL && strchr(to, '/') == NULL) {
+		/* We only want to search in the final path component. Don't
+		   include the final '/' in that component; if `from` is empty,
+		   we want it to first match after the '/', not before. */
+		search_start = strrchr(orig, '/');
+
+		if (search_start == NULL)
+			search_start = orig;
+		else
+			search_start++;
+	}
+
+	return strstr(search_start, from);
+}
+
+static int string_replace(char *from, char *to, char *orig, char **newname)
 {
 	char *p, *q, *where;
+	size_t count = 0, fromlen = strlen(from);
 
-	where = strstr(s, from);
+	p = where = find_initial_replace(from, to, orig);
 	if (where == NULL)
 		return 1;
+	count++;
+	while ((all || last) && p && *p) {
+		p = strstr(p + (last ? 1 : max(fromlen, (size_t) 1)), from);
+		if (p) {
+			if (all)
+				count++;
+			if (last)
+				where = p;
+		}
+	}
 	p = orig;
-	*newname = xmalloc(strlen(orig) + strlen(to) + 1);
+	*newname = xmalloc(strlen(orig) - count * fromlen + count * strlen(to) + 1);
 	q = *newname;
-	while (p < where)
-		*q++ = *p++;
-	p = to;
-	while (*p)
-		*q++ = *p++;
-	p = where + strlen(from);
+	while (count--) {
+		while (p < where)
+			*q++ = *p++;
+		p = to;
+		while (*p)
+			*q++ = *p++;
+		if (fromlen > 0) {
+			p = where + fromlen;
+			where = strstr(p, from);
+		} else {
+			p = where;
+			where += 1;
+		}
+	}
 	while (*p)
 		*q++ = *p++;
 	*q = 0;
@@ -135,7 +178,7 @@ static int do_symlink(char *from, char *to, char *s, int verbose, int noact,
 	}
 	target[ssz] = '\0';
 
-	if (string_replace(from, to, target, target, &newname) != 0)
+	if (string_replace(from, to, target, &newname) != 0)
 		ret = 0;
 
 	if (ret == 1 && (nooverwrite || interactive) && lstat(newname, &sb) != 0)
@@ -169,7 +212,7 @@ static int do_symlink(char *from, char *to, char *s, int verbose, int noact,
 static int do_file(char *from, char *to, char *s, int verbose, int noact,
                    int nooverwrite, int interactive)
 {
-	char *newname = NULL, *file=NULL;
+	char *newname = NULL;
 	int ret = 1;
 	struct stat sb;
 
@@ -186,11 +229,7 @@ static int do_file(char *from, char *to, char *s, int verbose, int noact,
 		warn(_("stat of %s failed"), s);
 		return 2;
 	}
-	if (strchr(from, '/') == NULL && strchr(to, '/') == NULL)
-		file = strrchr(s, '/');
-	if (file == NULL)
-		file = s;
-	if (string_replace(from, to, file, s, &newname) != 0)
+	if (string_replace(from, to, s, &newname) != 0)
 		return 0;
 
 	if ((nooverwrite || interactive) && access(newname, F_OK) != 0)
@@ -226,6 +265,8 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -v, --verbose       explain what is being done\n"), out);
 	fputs(_(" -s, --symlink       act on the target of symlinks\n"), out);
 	fputs(_(" -n, --no-act        do not make any changes\n"), out);
+	fputs(_(" -a, --all           replace all occurrences\n"), out);
+	fputs(_(" -l, --last          replace only the last occurrence\n"), out);
 	fputs(_(" -o, --no-overwrite  don't overwrite existing files\n"), out);
 	fputs(_(" -i, --interactive   prompt before overwrite\n"), out);
 	fputs(USAGE_SEPARATOR, out);
@@ -246,33 +287,46 @@ int main(int argc, char **argv)
 		{"verbose", no_argument, NULL, 'v'},
 		{"version", no_argument, NULL, 'V'},
 		{"help", no_argument, NULL, 'h'},
+		{"all", no_argument, NULL, 'a'},
+		{"last", no_argument, NULL, 'l'},
 		{"no-act", no_argument, NULL, 'n'},
 		{"no-overwrite", no_argument, NULL, 'o'},
 		{"interactive", no_argument, NULL, 'i'},
 		{"symlink", no_argument, NULL, 's'},
 		{NULL, 0, NULL, 0}
 	};
+	static const ul_excl_t excl[] = {       /* rows and cols in ASCII order */
+		{ 'a','l' },
+		{ 'i','o' },
+		{ 0 }
+	};
+	int excl_st[ARRAY_SIZE(excl)] = UL_EXCL_STATUS_INIT;
 
 	setlocale(LC_ALL, "");
 	bindtextdomain(PACKAGE, LOCALEDIR);
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	while ((c = getopt_long(argc, argv, "vsVhnoi", longopts, NULL)) != -1)
+	while ((c = getopt_long(argc, argv, "vsVhnaloi", longopts, NULL)) != -1) {
+		err_exclusive_options(c, longopts, excl, excl_st);
 		switch (c) {
 		case 'n':
 			noact = 1;
+			break;
+		case 'a':
+			all = 1;
+			break;
+		case 'l':
+			last = 1;
 			break;
 		case 'v':
 			verbose = 1;
 			break;
 		case 'o':
 			nooverwrite = 1;
-			interactive = 0;
 			break;
 		case 'i':
 			interactive = 1;
-			nooverwrite = 0;
 			break;
 		case 's':
 			do_rename = do_symlink;
@@ -285,6 +339,7 @@ int main(int argc, char **argv)
 		default:
 			errtryhelp(EXIT_FAILURE);
 		}
+	}
 
 	argc -= optind;
 	argv += optind;

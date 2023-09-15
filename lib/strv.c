@@ -1,6 +1,8 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
  *
- * Copyright 2010 Lennart Poettering
+ * Copyright (C) 2010 Lennart Poettering
+ * Copyright (C) 2015-2022 Karel Zak <kzak@redhat.com>
  *
  * This is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -162,7 +164,7 @@ int strv_extend_strv_concat(char ***a, char **b, const char *suffix) {
         STRV_FOREACH(s, b) {
                 char *v;
 
-                v = strappend(*s, suffix);
+                v = strconcat(*s, suffix);
                 if (!v)
                         return -ENOMEM;
 

@@ -27,11 +27,11 @@
 #include "closestream.h"
 #include "path.h"
 #include "pathnames.h"
-#include "procutils.h"
+#include "procfs.h"
 #include "sched_attr.h"
 #include "strutils.h"
 
-#define NOT_SET		-2U
+#define NOT_SET		0xdeadbeef
 
 struct uclampset {
 	unsigned int util_min;
@@ -94,7 +94,7 @@ static void show_uclamp_pid_info(pid_t pid, char *cmd)
 	if (cmd)
 		comm = cmd;
 	else
-		comm = proc_get_command_name(pid);
+		comm = pid_get_cmdname(pid);
 
 	printf(_("%s (%d) util_clamp: min: %d max: %d\n"),
 	       comm ? : "unknown", pid, sa.sched_util_min, sa.sched_util_max);
@@ -134,16 +134,17 @@ static void show_uclamp_info(struct uclampset *ctl)
 	if (ctl->system) {
 		show_uclamp_system_info();
 	} else if (ctl->all_tasks) {
+		DIR *sub = NULL;
 		pid_t tid;
-		struct proc_tasks *ts = proc_open_tasks(ctl->pid);
+		struct path_cxt *pc = ul_new_procfs_path(ctl->pid, NULL);
 
-		if (!ts)
+		if (!pc)
 			err(EXIT_FAILURE, _("cannot obtain the list of tasks"));
 
-		while (!proc_next_tid(ts, &tid))
+		while (procfs_process_next_tid(pc, &sub, &tid) == 0)
 			show_uclamp_pid_info(tid, NULL);
 
-		proc_close_tasks(ts);
+		ul_unref_path(pc);
 	} else {
 		show_uclamp_pid_info(ctl->pid, ctl->cmd);
 	}
@@ -175,17 +176,18 @@ static int set_uclamp_one(struct uclampset *ctl, pid_t pid)
 static void set_uclamp_pid(struct uclampset *ctl)
 {
 	if (ctl->all_tasks) {
+		DIR *sub = NULL;
 		pid_t tid;
-		struct proc_tasks *ts = proc_open_tasks(ctl->pid);
+		struct path_cxt *pc = ul_new_procfs_path(ctl->pid, NULL);
 
-		if (!ts)
+		if (!pc)
 			err(EXIT_FAILURE, _("cannot obtain the list of tasks"));
 
-		while (!proc_next_tid(ts, &tid))
+		while (procfs_process_next_tid(pc, &sub, &tid) == 0) {
 			if (set_uclamp_one(ctl, tid) == -1)
 				err(EXIT_FAILURE, _("failed to set tid %d's uclamp values"), tid);
-
-		proc_close_tasks(ts);
+		}
+		ul_unref_path(pc);
 
 	} else if (set_uclamp_one(ctl, ctl->pid) == -1) {
 		err(EXIT_FAILURE, _("failed to set pid %d's uclamp values"), ctl->pid);
@@ -207,14 +209,6 @@ static void set_uclamp_system(struct uclampset *ctl)
 
 	write_uclamp_sysfs(_PATH_PROC_UCLAMP_MIN, ctl->util_min);
 	write_uclamp_sysfs(_PATH_PROC_UCLAMP_MAX, ctl->util_max);
-}
-
-static void validate_util(int val)
-{
-	if (val > 1024 || val < -1) {
-		errno = EINVAL;
-		err(EXIT_FAILURE, _("%d out of range"), val);
-	}
 }
 
 int main(int argc, char **argv)
@@ -266,12 +260,10 @@ int main(int argc, char **argv)
 		case 'm':
 			ctl->util_min = strtos32_or_err(optarg, _("invalid util_min argument"));
 			ctl->util_min_set = 1;
-			validate_util(ctl->util_min);
 			break;
 		case 'M':
 			ctl->util_max = strtos32_or_err(optarg, _("invalid util_max argument"));
 			ctl->util_max_set = 1;
-			validate_util(ctl->util_max);
 			break;
 		case 'V':
 			print_version(EXIT_SUCCESS);

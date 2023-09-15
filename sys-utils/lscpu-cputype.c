@@ -2,6 +2,10 @@
 #include <sys/utsname.h>
 #include <sys/personality.h>
 
+#if defined(HAVE_LIBRTAS)
+# include <librtas.h>
+#endif
+
 #include "lscpu.h"
 
 #include "fileutils.h"
@@ -170,7 +174,8 @@ enum {
 	PAT_TYPE,
 	PAT_VARIANT,
 	PAT_VENDOR,
-	PAT_CACHE
+	PAT_CACHE,
+	PAT_ISA,
 };
 
 /*
@@ -188,12 +193,17 @@ static const struct cpuinfo_pattern type_patterns[] =
 {
 	/* Sort by fields name! */
 	DEF_PAT_CPUTYPE( "ASEs implemented",	PAT_FLAGS,	flags),		/* mips */
+	DEF_PAT_CPUTYPE( "Address Sizes",	PAT_ADDRESS_SIZES,	addrsz),/* loongarch */
 	DEF_PAT_CPUTYPE( "BogoMIPS",		PAT_BOGOMIPS,	bogomips),	/* aarch64 */
+	DEF_PAT_CPUTYPE( "CPU Family",		PAT_FAMILY,	family),	/* loongarch */
+	DEF_PAT_CPUTYPE( "CPU Revision",	PAT_REVISION,	revision),	/* loongarch */
 	DEF_PAT_CPUTYPE( "CPU implementer",	PAT_IMPLEMENTER,vendor),	/* ARM and aarch64 */
 	DEF_PAT_CPUTYPE( "CPU part",		PAT_PART,	model),		/* ARM and aarch64 */
 	DEF_PAT_CPUTYPE( "CPU revision",	PAT_REVISION,	revision),	/* aarch64 */
 	DEF_PAT_CPUTYPE( "CPU variant",		PAT_VARIANT,	stepping),	/* aarch64 */
 	DEF_PAT_CPUTYPE( "Features",		PAT_FEATURES,	flags),		/* aarch64 */
+	DEF_PAT_CPUTYPE( "ISA",			PAT_ISA,	isa),		/* loongarch */
+	DEF_PAT_CPUTYPE( "Model Name",		PAT_MODEL_NAME,	modelname),	/* loongarch */
 	DEF_PAT_CPUTYPE( "address sizes",	PAT_ADDRESS_SIZES,	addrsz),/* x86 */
 	DEF_PAT_CPUTYPE( "bogomips per cpu",	PAT_BOGOMIPS,	bogomips),	/* s390 */
 	DEF_PAT_CPUTYPE( "cpu",			PAT_CPU,	modelname),	/* ppc, sparc */
@@ -226,6 +236,7 @@ static const struct cpuinfo_pattern type_patterns[] =
 static const struct cpuinfo_pattern cpu_patterns[] =
 {
 	/* Sort by fields name! */
+	DEF_PAT_CPU( "CPU MHz",		PAT_MHZ,          mhz),		/* loongarch */
 	DEF_PAT_CPU( "bogomips",	PAT_BOGOMIPS_CPU, bogomips),
 	DEF_PAT_CPU( "cpu MHz",		PAT_MHZ,          mhz),
 	DEF_PAT_CPU( "cpu MHz dynamic",	PAT_MHZ_DYNAMIC,  dynamic_mhz),	/* s390 */
@@ -283,7 +294,7 @@ static int is_different_cputype(struct lscpu_cputype *ct, size_t offset, const c
 	return 0;
 }
 
-/* cannonicalize @str -- remove number at the end return the
+/* canonicalize @str -- remove number at the end return the
  * number by @keynum. This is usable for example for "processor 5" or "cache1"
  * cpuinfo lines */
 static char *key_cleanup(char *str, int *keynum)
@@ -317,7 +328,7 @@ static char *key_cleanup(char *str, int *keynum)
 
 static const struct cpuinfo_pattern *cpuinfo_parse_line(char *str, char **value, int *keynum)
 {
-	struct cpuinfo_pattern key, *pat;
+	struct cpuinfo_pattern key = { .id = 0 }, *pat;
 	char *p, *v;
 	char buf[CPUTYPE_PATTERN_BUFSZ] = { 0 };
 
@@ -569,7 +580,7 @@ int lscpu_read_cpuinfo(struct lscpu_cxt *cxt)
 	/* Set the default type to CPUs which are missing (or not parsed)
 	 * in cpuinfo */
 	ct = lscpu_cputype_get_default(cxt);
-	for (i = 0; i < cxt->npossibles; i++) {
+	for (i = 0; ct && i < cxt->npossibles; i++) {
 		struct lscpu_cpu *cpu = cxt->cpus[i];
 
 		if (cpu && !cpu->type)
@@ -635,6 +646,16 @@ struct lscpu_arch *lscpu_read_architecture(struct lscpu_cxt *cxt)
 			ar->bit32 = 1, ar->bit64 = 1;			/* s390x */
 		if (strstr(buf, " sun4v ") || strstr(buf, " sun4u "))
 			ar->bit32 = 1, ar->bit64 = 1;			/* sparc64 */
+	}
+
+	if (ct && ct->isa) {
+		char buf[BUFSIZ];
+
+		snprintf(buf, sizeof(buf), " %s ", ct->isa);
+		if (strstr(buf, " loongarch32 "))
+			ar->bit32 = 1;
+		if (strstr(buf, " loongarch64 "))
+			ar->bit64 = 1;
 	}
 
 	if (ar->name && !cxt->noalive) {

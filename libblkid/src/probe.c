@@ -71,7 +71,7 @@
  *
  * <informalexample>
  *   <programlisting>
- *	while((blkid_do_probe(pr) == 0)
+ *	while((blkid_do_probe(pr) == BLKID_PROBE_OK)
  *		... use result ...
  *   </programlisting>
  * </informalexample>
@@ -90,6 +90,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #ifdef HAVE_LINUX_CDROM_H
 #include <linux/cdrom.h>
@@ -103,16 +104,23 @@
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
 #endif
+#ifdef HAVE_LINUX_FD_H
+#include <linux/fd.h>
+#endif
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <limits.h>
+#ifdef HAVE_OPAL_GET_STATUS
+#include <linux/sed-opal.h>
+#endif
 
 #include "blkidP.h"
 #include "all-io.h"
 #include "sysfs.h"
 #include "strutils.h"
 #include "list.h"
+#include "fileutils.h"
 
 /*
  * All supported chains
@@ -135,7 +143,6 @@ blkid_probe blkid_new_probe(void)
 	int i;
 	blkid_probe pr;
 
-	blkid_init_debug(0);
 	pr = calloc(1, sizeof(struct blkid_struct_probe));
 	if (!pr)
 		return NULL;
@@ -247,6 +254,7 @@ void blkid_free_probe(blkid_probe pr)
 		if (ch->driver->free_data)
 			ch->driver->free_data(pr, ch->data);
 		free(ch->fltr);
+		ch->fltr = NULL;
 	}
 
 	if ((pr->flags & BLKID_FL_PRIVATE_FD) && pr->fd >= 0)
@@ -553,13 +561,20 @@ static struct blkid_bufinfo *read_buffer(blkid_probe pr, uint64_t real_off, uint
 	}
 
 	/* allocate info and space for data by one malloc call */
-	bf = calloc(1, sizeof(struct blkid_bufinfo) + len);
+	bf = calloc(1, sizeof(struct blkid_bufinfo));
 	if (!bf) {
 		errno = ENOMEM;
 		return NULL;
 	}
 
-	bf->data = ((unsigned char *) bf) + sizeof(struct blkid_bufinfo);
+	bf->data = mmap(NULL, len, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (bf->data == MAP_FAILED) {
+		free(bf);
+		errno = ENOMEM;
+		return NULL;
+	}
+
 	bf->len = len;
 	bf->off = real_off;
 	INIT_LIST_HEAD(&bf->bufs);
@@ -570,14 +585,33 @@ static struct blkid_bufinfo *read_buffer(blkid_probe pr, uint64_t real_off, uint
 	ret = read(pr->fd, bf->data, len);
 	if (ret != (ssize_t) len) {
 		DBG(LOWPROBE, ul_debug("\tread failed: %m"));
+		munmap(bf->data, bf->len);
 		free(bf);
 
 		/* I/O errors on CDROMs are non-fatal to work with hybrid
 		 * audio+data disks */
-		if (ret >= 0 || blkid_probe_is_cdrom(pr))
+		if (ret >= 0 || blkid_probe_is_cdrom(pr) || blkdid_probe_is_opal_locked(pr))
 			errno = 0;
+#ifdef HAVE_OPAL_GET_STATUS
+		else {
+			struct opal_status st = { };
+
+			/* If the device is locked with OPAL, we'll fail to read with I/O
+			 * errors when probing deep into the block device. Do not return
+			 * an error, so that we can move on to different types of checks.*/
+			ret = ioctl(pr->fd, IOC_OPAL_GET_STATUS, &st);
+			if (ret == 0 && (st.flags & OPAL_FL_LOCKED)) {
+				pr->flags |= BLKID_FL_OPAL_LOCKED;
+				errno = 0;
+			}
+		}
+#endif
+
 		return NULL;
 	}
+
+	if (mprotect(bf->data, len, PROT_READ))
+		DBG(LOWPROBE, ul_debug("\tmprotect failed: %m"));
 
 	return bf;
 }
@@ -616,6 +650,11 @@ static int hide_buffer(blkid_probe pr, uint64_t off, uint64_t len)
 	struct list_head *p;
 	int ct = 0;
 
+	if (UINT64_MAX - len < off) {
+		DBG(BUFFER, ul_debug("\t  hide-buffer overflow (ignore)"));
+		return -EINVAL;
+	}
+
 	list_for_each(p, &pr->buffers) {
 		struct blkid_bufinfo *x =
 			list_entry(p, struct blkid_bufinfo, bufs);
@@ -630,7 +669,9 @@ static int hide_buffer(blkid_probe pr, uint64_t off, uint64_t len)
 
 			DBG(BUFFER, ul_debug("\thiding: off=%"PRIu64" len=%"PRIu64,
 						off, len));
+			mprotect(x->data, x->len, PROT_READ | PROT_WRITE);
 			memset(data, 0, len);
+			mprotect(x->data, x->len, PROT_READ);
 			ct++;
 		}
 	}
@@ -642,7 +683,7 @@ static int hide_buffer(blkid_probe pr, uint64_t off, uint64_t len)
  * Note that @off is offset within probing area, the probing area is defined by
  * pr->off and pr->size.
  */
-unsigned char *blkid_probe_get_buffer(blkid_probe pr, uint64_t off, uint64_t len)
+const unsigned char *blkid_probe_get_buffer(blkid_probe pr, uint64_t off, uint64_t len)
 {
 	struct blkid_bufinfo *bf = NULL;
 	uint64_t real_off = pr->off + off;
@@ -651,14 +692,25 @@ unsigned char *blkid_probe_get_buffer(blkid_probe pr, uint64_t off, uint64_t len
 	DBG(BUFFER, ul_debug("\t>>>> off=%ju, real-off=%ju (probe <%ju..%ju>, len=%ju",
 				off, real_off, pr->off, pr->off + pr->size, len));
 	*/
-
 	if (pr->size == 0) {
 		errno = EINVAL;
 		return NULL;
 	}
 
-	if (len == 0 || (!S_ISCHR(pr->mode) && pr->off + pr->size < real_off + len)) {
-		DBG(BUFFER, ul_debug("\t  ignore: request out of probing area"));
+	if (UINT64_MAX - len < off || UINT64_MAX - len < real_off) {
+		DBG(BUFFER, ul_debug("\t  read-buffer overflow (ignore)"));
+		return NULL;
+	}
+
+	if (len > 8388608 /* 8 Mib */ ) {
+		DBG(BUFFER, ul_debug("\t  too large read request (ignore)"));
+		return NULL;
+	}
+
+	if (len == 0
+	    || (!S_ISCHR(pr->mode) && (pr->size < off || pr->size < len))
+	    || (!S_ISCHR(pr->mode) && (pr->off + pr->size < real_off + len))) {
+		DBG(BUFFER, ul_debug("\t  read-buffer out of probing area (ignore)"));
 		errno = 0;
 		return NULL;
 	}
@@ -728,6 +780,7 @@ int blkid_probe_reset_buffers(blkid_probe pr)
 
 		DBG(BUFFER, ul_debug(" remove buffer: [off=%"PRIu64", len=%"PRIu64"]",
 		                     bf->off, bf->len));
+		munmap(bf->data, bf->len);
 		free(bf);
 	}
 
@@ -798,6 +851,11 @@ int blkid_probe_is_tiny(blkid_probe pr)
 int blkid_probe_is_cdrom(blkid_probe pr)
 {
 	return (pr->flags & BLKID_FL_CDROM_DEV);
+}
+
+int blkdid_probe_is_opal_locked(blkid_probe pr)
+{
+	return (pr->flags & BLKID_FL_OPAL_LOCKED);
 }
 
 #ifdef CDROM_GET_CAPABILITY
@@ -876,9 +934,7 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 	struct stat sb;
 	uint64_t devsiz = 0;
 	char *dm_uuid = NULL;
-#ifdef CDROM_GET_CAPABILITY
-	long last_written = 0;
-#endif
+	int is_floppy = 0;
 
 	blkid_reset_probe(pr);
 	blkid_probe_reset_buffers(pr);
@@ -910,6 +966,7 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 	if (fd < 0)
 		return 1;
 
+
 #if defined(POSIX_FADV_RANDOM) && defined(HAVE_POSIX_FADVISE)
 	/* Disable read-ahead */
 	posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
@@ -931,9 +988,17 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 			DBG(LOWPROBE, ul_debug("failed to get device size"));
 			goto err;
 		}
-	} else if (S_ISCHR(sb.st_mode))
+	} else if (S_ISCHR(sb.st_mode)) {
+		char buf[PATH_MAX];
+
+		if (!sysfs_chrdev_devno_to_devname(sb.st_rdev, buf, sizeof(buf))
+		    || strncmp(buf, "ubi", 3) != 0) {
+			DBG(LOWPROBE, ul_debug("no UBI char device"));
+			errno = EINVAL;
+			goto err;
+		}
 		devsiz = 1;		/* UBI devices are char... */
-	else if (S_ISREG(sb.st_mode))
+	} else if (S_ISREG(sb.st_mode))
 		devsiz = sb.st_size;	/* regular file */
 
 	pr->size = size ? (uint64_t)size : devsiz;
@@ -951,7 +1016,38 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 	if (pr->size <= 1440 * 1024 && !S_ISCHR(sb.st_mode))
 		pr->flags |= BLKID_FL_TINY_DEV;
 
+#ifdef FDGETFDCSTAT
+	if (S_ISBLK(sb.st_mode)) {
+		/*
+		 * Re-open without O_NONBLOCK for floppy device.
+		 *
+		 * Since kernel commit c7e9d0020361f4308a70cdfd6d5335e273eb8717
+		 * floppy drive works bad when opened with O_NONBLOCK.
+		 */
+		struct floppy_fdc_state flst;
+
+		if (ioctl(fd, FDGETFDCSTAT, &flst) >= 0) {
+			int flags = fcntl(fd, F_GETFL, 0);
+
+			if (flags < 0)
+				goto err;
+			if (flags & O_NONBLOCK) {
+				flags &= ~O_NONBLOCK;
+
+				fd = ul_reopen(fd, flags | O_CLOEXEC);
+				if (fd < 0)
+					goto err;
+
+				pr->flags |= BLKID_FL_PRIVATE_FD;
+				pr->fd = fd;
+			}
+			is_floppy = 1;
+		}
+		errno = 0;
+	}
+#endif
 	if (S_ISBLK(sb.st_mode) &&
+	    !is_floppy &&
 	    sysfs_devno_is_dm_private(sb.st_rdev, &dm_uuid)) {
 		DBG(LOWPROBE, ul_debug("ignore private device mapper device"));
 		pr->flags |= BLKID_FL_NOSCAN_DEV;
@@ -961,7 +1057,10 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 	else if (S_ISBLK(sb.st_mode) &&
 	    !blkid_probe_is_tiny(pr) &&
 	    !dm_uuid &&
+	    !is_floppy &&
 	    blkid_probe_is_wholedisk(pr)) {
+
+		long last_written = 0;
 
 		/*
 		 * pktcdvd.ko accepts only these ioctls:
@@ -986,8 +1085,12 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 		}
 
 # ifdef CDROM_LAST_WRITTEN
-		if (ioctl(fd, CDROM_LAST_WRITTEN, &last_written) == 0)
+		if (ioctl(fd, CDROM_LAST_WRITTEN, &last_written) == 0) {
 			pr->flags |= BLKID_FL_CDROM_DEV;
+		} else {
+			if (errno == ENOMEDIUM)
+				goto err;
+		}
 # endif
 
 		if (pr->flags & BLKID_FL_CDROM_DEV) {
@@ -1006,7 +1109,7 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 	free(dm_uuid);
 
 # ifdef BLKGETZONESZ
-	if (S_ISBLK(sb.st_mode)) {
+	if (S_ISBLK(sb.st_mode) && !is_floppy) {
 		uint32_t zone_size_sector;
 
 		if (!ioctl(pr->fd, BLKGETZONESZ, &zone_size_sector))
@@ -1014,8 +1117,8 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 	}
 # endif
 
-	DBG(LOWPROBE, ul_debug("ready for low-probing, offset=%"PRIu64", size=%"PRIu64"",
-				pr->off, pr->size));
+	DBG(LOWPROBE, ul_debug("ready for low-probing, offset=%"PRIu64", size=%"PRIu64", zonesize=%"PRIu64,
+				pr->off, pr->size, pr->zone_size));
 	DBG(LOWPROBE, ul_debug("whole-disk: %s, regfile: %s",
 		blkid_probe_is_wholedisk(pr) ?"YES" : "NO",
 		S_ISREG(pr->mode) ? "YES" : "NO"));
@@ -1053,7 +1156,7 @@ int blkid_probe_set_dimension(blkid_probe pr, uint64_t off, uint64_t size)
 	return 0;
 }
 
-unsigned char *_blkid_probe_get_sb(blkid_probe pr, const struct blkid_idmag *mag, size_t size)
+const unsigned char *blkid_probe_get_sb_buffer(blkid_probe pr, const struct blkid_idmag *mag, size_t size)
 {
 	uint64_t hint_offset;
 
@@ -1081,7 +1184,7 @@ int blkid_probe_get_idmag(blkid_probe pr, const struct blkid_idinfo *id,
 
 	/* try to detect by magic string */
 	while(mag && mag->magic) {
-		unsigned char *buf;
+		const unsigned char *buf;
 		uint64_t kboff;
 		uint64_t hint_offset;
 
@@ -1108,7 +1211,7 @@ int blkid_probe_get_idmag(blkid_probe pr, const struct blkid_idinfo *id,
 		if (buf && !memcmp(mag->magic,
 				buf + (mag->sboff & 0x3ff), mag->len)) {
 
-			DBG(LOWPROBE, ul_debug("\tmagic sboff=%u, kboff=%ld",
+			DBG(LOWPROBE, ul_debug("\tmagic sboff=%u, kboff=%" PRIu64,
 				mag->sboff, kboff));
 			if (offset)
 				*offset = off + (mag->sboff & 0x3ff);
@@ -1157,7 +1260,7 @@ static inline void blkid_probe_end(blkid_probe pr)
  * <example>
  *   <title>basic case - use the first result only</title>
  *   <programlisting>
- *	if (blkid_do_probe(pr) == 0) {
+ *	if (blkid_do_probe(pr) == BLKID_PROBE_OK) {
  *		int nvals = blkid_probe_numof_values(pr);
  *		for (n = 0; n < nvals; n++) {
  *			if (blkid_probe_get_value(pr, n, &name, &data, &len) == 0)
@@ -1170,7 +1273,7 @@ static inline void blkid_probe_end(blkid_probe pr)
  * <example>
  *   <title>advanced case - probe for all signatures</title>
  *   <programlisting>
- *	while (blkid_do_probe(pr) == 0) {
+ *	while (blkid_do_probe(pr) == BLKID_PROBE_OK) {
  *		int nvals = blkid_probe_numof_values(pr);
  *		...
  *	}
@@ -1186,7 +1289,7 @@ int blkid_do_probe(blkid_probe pr)
 	int rc = 1;
 
 	if (pr->flags & BLKID_FL_NOSCAN_DEV)
-		return 1;
+		return BLKID_PROBE_NONE;
 
 	do {
 		struct blkid_chain *chn = pr->cur_chain;
@@ -1211,7 +1314,7 @@ int blkid_do_probe(blkid_probe pr)
 				chn = pr->cur_chain = &pr->chains[idx];
 			else {
 				blkid_probe_end(pr);
-				return 1;	/* all chains already probed */
+				return BLKID_PROBE_NONE;	/* all chains already probed */
 			}
 		}
 
@@ -1228,7 +1331,10 @@ int blkid_do_probe(blkid_probe pr)
 		/* rc: -1 = error, 0 = success, 1 = no result */
 		rc = chn->driver->probe(pr, chn);
 
-	} while (rc == 1);
+	} while (rc == BLKID_PROBE_NONE);
+
+	if (rc < 0)
+	       return BLKID_PROBE_ERROR;
 
 	return rc;
 }
@@ -1312,7 +1418,7 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
 
 	chn = pr->cur_chain;
 	if (!chn)
-		return -1;
+		return BLKID_PROBE_ERROR;
 
 	switch (chn->driver->id) {
 	case BLKID_CHAIN_SUBLKS:
@@ -1326,28 +1432,28 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
 			rc = blkid_probe_lookup_value(pr, "PTMAGIC", NULL, &len);
 		break;
 	default:
-		return 0;
+		return BLKID_PROBE_OK;
 	}
 
 	if (rc || len == 0 || off == NULL)
-		return 0;
+		return BLKID_PROBE_OK;
 
 	errno = 0;
 	magoff = strtoumax(off, NULL, 10);
 	if (errno)
-		return 0;
+		return BLKID_PROBE_OK;
 
 	offset = magoff + pr->off;
 	fd = blkid_probe_get_fd(pr);
 	if (fd < 0)
-		return -1;
+		return BLKID_PROBE_ERROR;
 
 	if (len > sizeof(buf))
 		len = sizeof(buf);
 
 	rc = is_conventional(pr, offset);
 	if (rc < 0)
-		return rc;
+		return BLKID_PROBE_ERROR;
 	conventional = rc == 1;
 
 	DBG(LOWPROBE, ul_debug(
@@ -1355,7 +1461,7 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
 	    offset, offset, len, chn->driver->name, chn->idx, dryrun ? "yes" : "not"));
 
 	if (lseek(fd, offset, SEEK_SET) == (off_t) -1)
-		return -1;
+		return BLKID_PROBE_ERROR;
 
 	if (!dryrun && len) {
 		if (conventional) {
@@ -1363,8 +1469,9 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
 
 			/* wipen on device */
 			if (write_all(fd, buf, len))
-				return -1;
-			fsync(fd);
+				return BLKID_PROBE_ERROR;
+			if (fsync(fd) != 0)
+				return BLKID_PROBE_ERROR;
 		} else {
 #ifdef HAVE_LINUX_BLKZONED_H
 			uint64_t zone_mask = ~(pr->zone_size - 1);
@@ -1375,7 +1482,7 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
 
 			rc = ioctl(fd, BLKRESETZONE, &range);
 			if (rc < 0)
-				return -1;
+				return BLKID_PROBE_ERROR;
 #else
 			/* Should not reach here */
 			assert(0);
@@ -1394,7 +1501,7 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
 		return blkid_probe_step_back(pr);
 	}
 
-	return 0;
+	return BLKID_PROBE_OK;
 }
 
 /**
@@ -1423,7 +1530,7 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
  *      blkid_probe_enable_partitions(pr, 1);
  *      blkid_probe_set_partitions_flags(pr, BLKID_PARTS_MAGIC);
  *
- *	while (blkid_do_probe(pr) == 0) {
+ *	while (blkid_do_probe(pr) == BLKID_PROBE_OK) {
  *		const char *ostr = NULL;
  *		size_t len = 0;
  *
@@ -1509,7 +1616,7 @@ int blkid_do_safeprobe(blkid_probe pr)
 	int i, count = 0, rc = 0;
 
 	if (pr->flags & BLKID_FL_NOSCAN_DEV)
-		return 1;
+		return BLKID_PROBE_NONE;
 
 	blkid_probe_start(pr);
 
@@ -1542,8 +1649,9 @@ int blkid_do_safeprobe(blkid_probe pr)
 done:
 	blkid_probe_end(pr);
 	if (rc < 0)
-		return rc;
-	return count ? 0 : 1;
+		return BLKID_PROBE_ERROR;
+
+	return count == 0 ? BLKID_PROBE_NONE : BLKID_PROBE_OK;
 }
 
 /**
@@ -1563,7 +1671,7 @@ int blkid_do_fullprobe(blkid_probe pr)
 	int i, count = 0, rc = 0;
 
 	if (pr->flags & BLKID_FL_NOSCAN_DEV)
-		return 1;
+		return BLKID_PROBE_NONE;
 
 	blkid_probe_start(pr);
 
@@ -1596,12 +1704,13 @@ int blkid_do_fullprobe(blkid_probe pr)
 done:
 	blkid_probe_end(pr);
 	if (rc < 0)
-		return rc;
-	return count ? 0 : 1;
+		return BLKID_PROBE_ERROR;
+
+	return count == 0 ? BLKID_PROBE_NONE : BLKID_PROBE_OK;
 }
 
 /* same sa blkid_probe_get_buffer() but works with 512-sectors */
-unsigned char *blkid_probe_get_sector(blkid_probe pr, unsigned int sector)
+const unsigned char *blkid_probe_get_sector(blkid_probe pr, unsigned int sector)
 {
 	return blkid_probe_get_buffer(pr, ((uint64_t) sector) << 9, 0x200);
 }
@@ -1718,16 +1827,34 @@ int blkid_probe_set_magic(blkid_probe pr, uint64_t offset,
 	return rc;
 }
 
-int blkid_probe_verify_csum(blkid_probe pr, uint64_t csum, uint64_t expected)
+static void blkid_probe_log_csum_mismatch(blkid_probe pr, size_t n, const void *csum,
+		const void *expected)
 {
-	if (csum != expected) {
+	char csum_hex[256];
+	char expected_hex[sizeof(csum_hex)];
+	int hex_size = min(sizeof(csum_hex), n * 2);
+
+	for (int i = 0; i < hex_size; i+=2) {
+		sprintf(&csum_hex[i], "%02X", ((const unsigned char *) csum)[i / 2]);
+		sprintf(&expected_hex[i], "%02X", ((const unsigned char *) expected)[i / 2]);
+	}
+
+	ul_debug(
+		"incorrect checksum for type %s,"
+		" got %*s, expected %*s",
+		blkid_probe_get_probername(pr),
+		hex_size, csum_hex, hex_size, expected_hex);
+}
+
+
+int blkid_probe_verify_csum_buf(blkid_probe pr, size_t n, const void *csum,
+		const void *expected)
+{
+	if (memcmp(csum, expected, n) != 0) {
 		struct blkid_chain *chn = blkid_probe_get_chain(pr);
 
-		DBG(LOWPROBE, ul_debug(
-				"incorrect checksum for type %s,"
-				" got %"PRIX64", expected %"PRIX64"",
-				blkid_probe_get_probername(pr),
-				csum, expected));
+		ON_DBG(LOWPROBE, blkid_probe_log_csum_mismatch(pr, n, csum, expected));
+
 		/*
 		 * Accept bad checksum if BLKID_SUBLKS_BADCSUM flags is set
 		 */
@@ -1741,6 +1868,11 @@ int blkid_probe_verify_csum(blkid_probe pr, uint64_t csum, uint64_t expected)
 
 accept:
 	return 1;
+}
+
+int blkid_probe_verify_csum(blkid_probe pr, uint64_t csum, uint64_t expected)
+{
+	return blkid_probe_verify_csum_buf(pr, sizeof(csum), &csum, &expected);
 }
 
 /**
@@ -1818,6 +1950,7 @@ blkid_probe blkid_probe_get_wholedisk_probe(blkid_probe pr)
 	if (!pr->disk_probe) {
 		/* Open a new disk prober */
 		char *disk_path = blkid_devno_to_devname(disk);
+		int flags;
 
 		if (!disk_path)
 			return NULL;
@@ -1830,6 +1963,11 @@ blkid_probe blkid_probe_get_wholedisk_probe(blkid_probe pr)
 
 		if (!pr->disk_probe)
 			return NULL;	/* ENOMEM? */
+
+		flags = blkid_probe_get_partitions_flags(pr);
+		if (flags & BLKID_PARTS_FORCE_GPT)
+			blkid_probe_set_partitions_flags(pr->disk_probe,
+							 BLKID_PARTS_FORCE_GPT);
 	}
 
 	return pr->disk_probe;

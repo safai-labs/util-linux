@@ -25,6 +25,8 @@
 #include <ctype.h>
 #include <assert.h>
 #include <unistd.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <sys/resource.h>
 
 #include <libsmartcols.h>
@@ -112,14 +114,14 @@ enum {
 
 /* column names */
 struct colinfo {
-	const char	*name;	/* header */
-	double		whint;	/* width hint (N < 1 is in percent of termwidth) */
-	int		flags;	/* SCOLS_FL_* */
-	const char      *help;
+	const char * const	name; /* header */
+	double			whint;	/* width hint (N < 1 is in percent of termwidth) */
+	int			flags;	/* SCOLS_FL_* */
+	const char		*help;
 };
 
 /* columns descriptions */
-static struct colinfo infos[] = {
+static const struct colinfo infos[] = {
 	[COL_RES]     = { "RESOURCE",    0.25, SCOLS_FL_TRUNC, N_("resource name") },
 	[COL_HELP]    = { "DESCRIPTION", 0.1,  SCOLS_FL_TRUNC, N_("resource description")},
 	[COL_SOFT]    = { "SOFT",        0.1,  SCOLS_FL_RIGHT, N_("soft limit")},
@@ -141,15 +143,19 @@ static int ncolumns;
 static pid_t pid; /* calling process (default) */
 static int verbose;
 
-#ifndef HAVE_PRLIMIT
+#ifdef HAVE_SYS_SYSCALL_H
 # include <sys/syscall.h>
+# if defined(SYS_prlimit64)
+#  ifndef HAVE_PRLIMIT
 static int prlimit(pid_t p, int resource,
 		   const struct rlimit *new_limit,
 		   struct rlimit *old_limit)
 {
 	return syscall(SYS_prlimit64, p, resource, new_limit, old_limit);
 }
-#endif
+#  endif /* !HAVE_PRLIMIT */
+# endif /* SYS_prlimit64 */
+#endif /* HAVE_SYS_SYSCALL_H */
 
 static void __attribute__((__noreturn__)) usage(void)
 {
@@ -159,14 +165,14 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(USAGE_HEADER, out);
 
 	fprintf(out,
-		_(" %s [options] [-p PID]\n"), program_invocation_short_name);
+		_(" %s [options] [--<resource>=<limit>] [-p PID]\n"), program_invocation_short_name);
 	fprintf(out,
-		_(" %s [options] COMMAND\n"), program_invocation_short_name);
+		_(" %s [options] [--<resource>=<limit>] COMMAND\n"), program_invocation_short_name);
 
 	fputs(USAGE_SEPARATOR, out);
 	fputs(_("Show or change the resource limits of a process.\n"), out);
 
-	fputs(_("\nGeneral Options:\n"), out);
+	fputs(USAGE_OPTIONS, out);
 	fputs(_(" -p, --pid <pid>        process id\n"
 		" -o, --output <list>    define which output columns to use\n"
 		"     --noheadings       don't print headings\n"
@@ -175,7 +181,7 @@ static void __attribute__((__noreturn__)) usage(void)
 		), out);
 	printf(USAGE_HELP_OPTIONS(24));
 
-	fputs(_("\nResources Options:\n"), out);
+	fputs(_("\nResources:\n"), out);
 	fputs(_(" -c, --core             maximum size of core files created\n"
 		" -d, --data             maximum size of a process's data segment\n"
 		" -e, --nice             maximum nice priority allowed to raise\n"
@@ -194,6 +200,11 @@ static void __attribute__((__noreturn__)) usage(void)
 		" -y, --rttime           CPU time in microseconds a process scheduled\n"
 		"                        under real-time scheduling\n"), out);
 
+	fputs(USAGE_ARGUMENTS, out);
+	fputs(_(
+		" <limit> is defined as a range soft:hard, soft:, :hard or a value to\n"
+		"         define both limits (e.g. -e=0:10 -r=:10).\n"), out);
+
 	fputs(USAGE_COLUMNS, out);
 	for (i = 0; i < ARRAY_SIZE(infos); i++)
 		fprintf(out, " %11s  %s\n", infos[i].name, _(infos[i].help));
@@ -211,7 +222,7 @@ static inline int get_column_id(int num)
 	return columns[num];
 }
 
-static inline struct colinfo *get_column_info(unsigned num)
+static inline const struct colinfo *get_column_info(unsigned num)
 {
 	return &infos[ get_column_id(num) ];
 }
@@ -303,7 +314,7 @@ static int show_limits(struct list_head *lims)
 	scols_table_enable_noheadings(table, no_headings);
 
 	for (i = 0; i < ncolumns; i++) {
-		struct colinfo *col = get_column_info(i);
+		const struct colinfo *col = get_column_info(i);
 
 		if (!scols_table_new_column(table, col->name, col->whint, col->flags))
 			err(EXIT_FAILURE, _("failed to allocate output column"));
@@ -444,8 +455,10 @@ static int get_range(char *str, rlim_t *soft, rlim_t *hard, int *found)
 		}
 		*found |= PRLIMIT_SOFT | PRLIMIT_HARD;
 
-	} else						/* <value> */
+	} else if (!*end)				/* <value> */
 		*found |= PRLIMIT_SOFT | PRLIMIT_HARD;
+	else
+		return -1;
 
 	return 0;
 }
@@ -453,7 +466,7 @@ static int get_range(char *str, rlim_t *soft, rlim_t *hard, int *found)
 
 static int parse_prlim(struct rlimit *lim, char *ops, size_t id)
 {
-	rlim_t soft, hard;
+	rlim_t soft = 0, hard = 0;
 	int found = 0;
 
 	if (ops && *ops == '=')

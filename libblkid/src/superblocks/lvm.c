@@ -4,7 +4,7 @@
  * Copyright (C) 2001 by Andreas Dilger
  * Copyright (C) 2004 Kay Sievers <kay.sievers@vrfy.org>
  * Copyright (C) 2008 Karel Zak <kzak@redhat.com>
- * Copyright (C) 2012 Milan Broz <mbroz@redhat.com>
+ * Copyright (C) 2012 Milan Broz <gmazyland@gmail.com>
  *
  * This file may be redistributed under the terms of the
  * GNU Lesser General Public License.
@@ -76,7 +76,7 @@ static int probe_lvm2(blkid_probe pr, const struct blkid_idmag *mag)
 	int sector = mag->kboff << 1;
 	struct lvm2_pv_label_header *label;
 	char uuid[LVM2_ID_LEN + 7];
-	unsigned char *buf;
+	const unsigned char *buf;
 
 	buf = blkid_probe_get_buffer(pr,
 			mag->kboff << 10,

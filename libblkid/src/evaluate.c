@@ -200,8 +200,10 @@ static char *evaluate_by_scan(const char *token, const char *value,
 
 	if (!c) {
 		char *cachefile = blkid_get_cache_filename(conf);
-		blkid_get_cache(&c, cachefile);
+		int rc = blkid_get_cache(&c, cachefile);
 		free(cachefile);
+		if (rc < 0)
+			return NULL;
 	}
 	if (!c)
 		return NULL;
@@ -233,9 +235,6 @@ char *blkid_evaluate_tag(const char *token, const char *value, blkid_cache *cach
 
 	if (!token)
 		return NULL;
-
-	if (!cache || !*cache)
-		blkid_init_debug(0);
 
 	DBG(EVALUATE, ul_debug("evaluating  %s%s%s", token, value ? "=" : "",
 		   value ? value : ""));
@@ -314,8 +313,6 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "usage: %s <tag> | <spec>\n", argv[0]);
 		return EXIT_FAILURE;
 	}
-
-	blkid_init_debug(0);
 
 	res = blkid_evaluate_spec(argv[1], &cache);
 	if (res)

@@ -190,6 +190,12 @@ extern int scols_column_set_color(struct libscols_column *cl, const char *color)
 extern const char *scols_column_get_color(const struct libscols_column *cl);
 extern struct libscols_table *scols_column_get_table(const struct libscols_column *cl);
 
+extern int scols_column_set_name(struct libscols_column *cl, const char *name);
+extern const char *scols_column_get_name(struct libscols_column *cl);
+extern const char *scols_column_get_name_as_shellvar(struct libscols_column *cl);
+
+extern int scols_column_set_properties(struct libscols_column *cl, const char *opts);
+
 extern int scols_column_set_cmpfunc(struct libscols_column *cl,
 			int (*cmp)(struct libscols_cell *a,
 				   struct libscols_cell *b, void *),
@@ -230,6 +236,7 @@ extern struct libscols_cell *scols_line_get_column_cell(
 extern int scols_line_set_data(struct libscols_line *ln, size_t n, const char *data);
 extern int scols_line_refer_data(struct libscols_line *ln, size_t n, char *data);
 extern int scols_line_set_column_data(struct libscols_line *ln, struct libscols_column *cl, const char *data);
+extern const char *scols_line_get_column_data(struct libscols_line *ln, struct libscols_column *cl);
 extern int scols_line_refer_column_data(struct libscols_line *ln, struct libscols_column *cl, char *data);
 extern struct libscols_line *scols_copy_line(const struct libscols_line *ln);
 
@@ -245,6 +252,7 @@ extern int scols_table_is_noheadings(const struct libscols_table *tb);
 extern int scols_table_is_header_repeat(const struct libscols_table *tb);
 extern int scols_table_is_empty(const struct libscols_table *tb);
 extern int scols_table_is_export(const struct libscols_table *tb);
+extern int scols_table_is_shellvar(const struct libscols_table *tb);
 extern int scols_table_is_maxout(const struct libscols_table *tb);
 extern int scols_table_is_minout(const struct libscols_table *tb);
 extern int scols_table_is_nowrap(const struct libscols_table *tb);
@@ -259,6 +267,7 @@ extern int scols_table_enable_json(struct libscols_table *tb, int enable);
 extern int scols_table_enable_noheadings(struct libscols_table *tb, int enable);
 extern int scols_table_enable_header_repeat(struct libscols_table *tb, int enable);
 extern int scols_table_enable_export(struct libscols_table *tb, int enable);
+extern int scols_table_enable_shellvar(struct libscols_table *tb, int enable);
 extern int scols_table_enable_maxout(struct libscols_table *tb, int enable);
 extern int scols_table_enable_minout(struct libscols_table *tb, int enable);
 extern int scols_table_enable_nowrap(struct libscols_table *tb, int enable);
@@ -283,6 +292,7 @@ extern const char *scols_table_get_line_separator(const struct libscols_table *t
 extern size_t scols_table_get_ncols(const struct libscols_table *tb);
 extern size_t scols_table_get_nlines(const struct libscols_table *tb);
 extern struct libscols_column *scols_table_get_column(struct libscols_table *tb, size_t n);
+struct libscols_column *scols_table_get_column_by_name(struct libscols_table *tb, const char *name);
 extern int scols_table_add_line(struct libscols_table *tb, struct libscols_line *ln);
 extern int scols_table_remove_line(struct libscols_table *tb, struct libscols_line *ln);
 extern void scols_table_remove_lines(struct libscols_table *tb);

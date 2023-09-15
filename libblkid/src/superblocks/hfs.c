@@ -173,18 +173,21 @@ static int probe_hfs(blkid_probe pr, const struct blkid_idmag *mag)
 
 	hfs_set_uuid(pr, hfs->finder_info.id, sizeof(hfs->finder_info.id));
 
-	blkid_probe_set_label(pr, hfs->label, hfs->label_len);
+	size = hfs->label_len;
+	if ((size_t) size > sizeof(hfs->label))
+		size = sizeof(hfs->label);
+	blkid_probe_set_label(pr, hfs->label, size);
 	return 0;
 }
 
 static int probe_hfsplus(blkid_probe pr, const struct blkid_idmag *mag)
 {
 	struct hfsplus_extent extents[HFSPLUS_EXTENT_COUNT];
-	struct hfsplus_bnode_descriptor *descr;
-	struct hfsplus_bheader_record *bnode;
-	struct hfsplus_catalog_key *key;
-	struct hfsplus_vol_header *hfsplus;
-	struct hfs_mdb *sbd;
+	const struct hfsplus_bnode_descriptor *descr;
+	const struct hfsplus_bheader_record *bnode;
+	const struct hfsplus_catalog_key *key;
+	const struct hfsplus_vol_header *hfsplus;
+	const struct hfs_mdb *sbd;
 	unsigned int alloc_block_size;
 	unsigned int alloc_first_block;
 	unsigned int embed_first_block;
@@ -200,7 +203,7 @@ static int probe_hfsplus(blkid_probe pr, const struct blkid_idmag *mag)
 	unsigned int leaf_block;
 	int ext;
 	uint64_t leaf_off;
-	unsigned char *buf;
+	const unsigned char *buf;
 
 	sbd = blkid_probe_get_sb(pr, mag, struct hfs_mdb);
 	if (!sbd)
@@ -222,7 +225,7 @@ static int probe_hfsplus(blkid_probe pr, const struct blkid_idmag *mag)
 		buf = blkid_probe_get_buffer(pr,
 				off + (mag->kboff * 1024),
 				sizeof(struct hfsplus_vol_header));
-		hfsplus = (struct hfsplus_vol_header *) buf;
+		hfsplus = (const struct hfsplus_vol_header *) buf;
 
 	} else
 		hfsplus = blkid_probe_get_sb(pr, mag,
@@ -241,6 +244,7 @@ static int probe_hfsplus(blkid_probe pr, const struct blkid_idmag *mag)
 	if (blocksize < HFSPLUS_SECTOR_SIZE)
 		return 1;
 
+	blkid_probe_set_fsblocksize(pr, blocksize);
 	blkid_probe_set_block_size(pr, blocksize);
 
 	memcpy(extents, hfsplus->cat_file.extents, sizeof(extents));

@@ -45,7 +45,7 @@ Copyright (c) 1992 Rik Faith (faith@cs.unc.edu)
 
 == NAME
 
-more - file perusal filter for crt viewing
+more - display the contents of a file in a terminal
 
 == SYNOPSIS
 
@@ -64,6 +64,9 @@ Prompt with "[Press space to continue, 'q' to quit.]", and display "[Press 'h' f
 
 *-l*, *--logical*::
 Do not pause after any line containing a *^L* (form feed).
+
+*-e*, *--exit-on-eof*::
+Exit on End-Of-File, enabled by default if POSIXLY_CORRECT environment variable is not set or if not executed on terminal.
 
 *-f*, *--no-pause*::
 Count logical lines, rather than screen lines (i.e., long lines are not folded).
@@ -92,11 +95,7 @@ Start displaying each file at line _number_.
 **+**/__string__::
 The _string_ to be searched in each file before starting to display it.
 
-*--help*::
-Display help text and exit.
-
-*-V*, *--version*::
-Display version information and exit.
+include::man-common/help-version.adoc[]
 
 == COMMANDS
 
@@ -180,6 +179,9 @@ The editor the user prefers. Invoked when command key _v_ is pressed.
 
 *EDITOR*::
 The editor of choice when *VISUAL* is not specified.
+
+*POSIXLY_CORRECT*::
+Disable exit-on-eof (see option *-e* for more details).
 
 == HISTORY
 

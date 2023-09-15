@@ -55,11 +55,13 @@
 #include "closestream.h"
 #include "nls.h"
 #include "pidfd-utils.h"
-#include "procutils.h"
+#include "procfs.h"
+#include "pathnames.h"
 #include "signames.h"
 #include "strutils.h"
 #include "ttyutils.h"
 #include "xalloc.h"
+#include "fileutils.h"
 
 /* partial success, otherwise we return regular EXIT_{SUCCESS,FAILURE} */
 #define KILL_EXIT_SOMEOK	64
@@ -93,6 +95,7 @@ struct kill_control {
 		check_all:1,
 		do_kill:1,
 		do_pid:1,
+		require_handler:1,
 		use_sigval:1,
 #ifdef UL_HAVE_PIDFD
 		timeout:1,
@@ -210,6 +213,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -p, --pid              print pids without signaling them\n"), out);
 	fputs(_(" -l, --list[=<signal>]  list signal names, or convert a signal number to a name\n"), out);
 	fputs(_(" -L, --table            list signal names and numbers\n"), out);
+	fputs(_(" -r, --require-handler  do not send signal if signal handler is not present\n"), out);
 	fputs(_("     --verbose          print pids that will be signaled\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
@@ -299,6 +303,10 @@ static char **parse_arguments(int argc, char **argv, struct kill_control *ctl)
 		if (!strcmp(arg, "-L") || !strcmp(arg, "--table")) {
 			print_all_signals(stdout, 1);
 			exit(EXIT_SUCCESS);
+		}
+		if (!strcmp(arg, "-r") || !strcmp(arg, "--require-handler")) {
+			ctl->require_handler = 1;
+			continue;
 		}
 		if (!strcmp(arg, "-p") || !strcmp(arg, "--pid")) {
 			ctl->do_pid = 1;
@@ -446,6 +454,32 @@ static int kill_verbose(const struct kill_control *ctl)
 	return rc;
 }
 
+static int check_signal_handler(const struct kill_control *ctl)
+{
+	uintmax_t sigcgt = 0;
+	int rc = 0, has_hnd = 0;
+	struct path_cxt *pc;
+
+	if (!ctl->require_handler)
+		return 1;
+
+	pc = ul_new_procfs_path(ctl->pid, NULL);
+	if (!pc)
+		return -ENOMEM;
+
+	rc = procfs_process_get_stat_nth(pc, 34, &sigcgt);
+	if (rc)
+		return -EINVAL;
+
+	ul_unref_path(pc);
+
+	has_hnd = ((1UL << (ctl->numsig - 1)) & sigcgt) != 0;
+	if (ctl->verbose && !has_hnd)
+		printf(_("not signalling pid %d, it has no userspace handler for signal %d\n"), ctl->pid, ctl->numsig);
+
+	return has_hnd;
+}
+
 int main(int argc, char **argv)
 {
 	struct kill_control ctl = { .numsig = SIGTERM };
@@ -468,27 +502,39 @@ int main(int argc, char **argv)
 		errno = 0;
 		ctl.pid = strtol(ctl.arg, &ep, 10);
 		if (errno == 0 && ep && *ep == '\0' && ctl.arg < ep) {
+			if (check_signal_handler(&ctl) <= 0)
+				continue;
 			if (kill_verbose(&ctl) != 0)
 				nerrs++;
 			ct++;
 		} else {
-			struct proc_processes *ps = proc_open_processes();
 			int found = 0;
+			struct dirent *d;
+			DIR *dir = opendir(_PATH_PROC);
+			uid_t uid = !ctl.check_all ? getuid() : 0;
 
-			if (!ps)
+			if (!dir)
 				continue;
-			if (!ctl.check_all)
-				proc_processes_filter_by_uid(ps, getuid());
 
-			proc_processes_filter_by_name(ps, ctl.arg);
-			while (proc_next_pid(ps, &ctl.pid) == 0) {
+			while ((d = xreaddir(dir))) {
+				if (!ctl.check_all &&
+				    !procfs_dirent_match_uid(dir, d, uid))
+					continue;
+				if (ctl.arg &&
+				    !procfs_dirent_match_name(dir, d, ctl.arg))
+					continue;
+				if (procfs_dirent_get_pid(d, &ctl.pid) != 0)
+					continue;
+				if (check_signal_handler(&ctl) <= 0)
+					continue;
+
 				if (kill_verbose(&ctl) != 0)
 					nerrs++;
 				ct++;
 				found = 1;
 			}
-			proc_close_processes(ps);
 
+			closedir(dir);
 			if (!found) {
 				nerrs++, ct++;
 				warnx(_("cannot find process \"%s\""), ctl.arg);

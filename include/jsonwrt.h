@@ -1,3 +1,7 @@
+/*
+ * No copyright is claimed.  This code is in the public domain; do with
+ * it what you wish.
+ */
 #ifndef UTIL_LINUX_JSONWRT_H
 #define UTIL_LINUX_JSONWRT_H
 
@@ -15,6 +19,7 @@ struct ul_jsonwrt {
 };
 
 void ul_jsonwrt_init(struct ul_jsonwrt *fmt, FILE *out, int indent);
+int ul_jsonwrt_is_ready(struct ul_jsonwrt *fmt);
 void ul_jsonwrt_indent(struct ul_jsonwrt *fmt);
 void ul_jsonwrt_open(struct ul_jsonwrt *fmt, const char *name, int type);
 void ul_jsonwrt_close(struct ul_jsonwrt *fmt, int type);

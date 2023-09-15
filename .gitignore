@@ -1,6 +1,7 @@
 #
 # generic stuff
 #
+*.deps
 *.gcda
 *.gcno
 *.gcov
@@ -45,10 +46,15 @@ config/test-driver
 configure
 cscope.out
 depcomp
+GPATH
+GRTAGS
+GTAGS
+GSYMS
 INSTALL
 install-sh
 libtool
 m4/*.m4
+m4/libtool.m4.orig
 Makefile
 Makefile.in
 missing
@@ -56,6 +62,7 @@ mkinstalldirs
 stamp-h
 stamp-h.in
 stamp-h1
+syscalls.h
 tags
 test-suite.log
 tests/run.sh.log
@@ -68,16 +75,18 @@ ylwrap
 #
 /addpart
 /agetty
+/build*/
 /blkdiscard
-/blkzone
 /blkid
+/blkpr
+/blkzone
 /blockdev
 /cal
 /cfdisk
 /chcpu
 /chfn
-/choom
 /chmem
+/choom
 /chrt
 /chsh
 /col
@@ -88,6 +97,8 @@ ylwrap
 /delpart
 /dmesg
 /eject
+/enosys
+/fadvise
 /fallocate
 /fdformat
 /fdisk
@@ -119,9 +130,11 @@ ylwrap
 /look
 /losetup
 /lsblk
+/lsclocks
+/lscpu
+/lsfd
 /lsipc
 /lsirq
-/lscpu
 /lslocks
 /lslogins
 /lsmem
@@ -142,6 +155,7 @@ ylwrap
 /nsenter
 /partx
 /pg
+/pipesz
 /pivot_root
 /prlimit
 /raw
@@ -155,8 +169,8 @@ ylwrap
 /runuser
 /sample-*
 /script
-/scriptreplay
 /scriptlive
+/scriptreplay
 /setarch
 /setpriv
 /setsid
@@ -171,6 +185,7 @@ ylwrap
 /taskset
 /test_*
 /tunelp
+/uclampset
 /ul
 /umount
 /unshare
@@ -179,11 +194,10 @@ ylwrap
 /uuidgen
 /uuidparse
 /vipw
+/waitpid
 /wall
 /wdctl
 /whereis
 /wipefs
 /write
 /zramctl
-/uclampset
-/build*/

@@ -9,6 +9,7 @@ option('cryptsetup',  type : 'feature')
 option('cryptsetup-dlopen',  type : 'feature')
 option('zlib',        type : 'feature')
 option('readline',    type : 'feature')
+option('nls',         type : 'feature')
 option('libutil',     type : 'feature')
 option('libutempter', type : 'feature')
 option('libpcre2-posix',     type : 'feature')
@@ -19,6 +20,8 @@ option('smack',       type : 'feature', value : 'disabled')
 option('magic',       type : 'feature')
 option('econf',       type : 'feature')
 option('systemd',     type : 'feature')
+option('sysvinit',    type : 'feature', value : 'disabled',
+       description : 'build and install sysvinit startup scripts')
 option('btrfs',       type : 'feature')
 option('widechar',    type : 'feature',
        description : 'compile with wide character support')
@@ -124,7 +127,7 @@ option('build-line', type : 'feature',
        description : 'build line')
 option('build-mesg', type : 'feature',
        description : 'build mesg')
-option('build-raw', type : 'feature',
+option('build-raw', type : 'feature', value : 'disabled',
        description : 'build raw')
 option('build-rename', type : 'feature',
        description : 'build rename')
@@ -150,6 +153,8 @@ option('build-more', type : 'feature',
        description : 'build more')
 option('build-pg', type : 'feature',
        description : 'build pg')
+option('build-pipesz', type : 'feature',
+       description : 'build pipesz')
 option('build-setterm', type : 'feature',
        description : 'build setterm')
 option('build-schedutils', type : 'feature',
@@ -172,6 +177,10 @@ option('static-programs', type : 'array',
 
 # feature selection and other configuration
 
+option('program-tests',
+       type: 'boolean', value : true,
+       description : 'build test programs')
+
 option('chfn-chsh-password',
        type : 'boolean', value : true,
        description : 'require the user to enter the password in chfn and chsh')
@@ -190,6 +199,8 @@ option('use-tls',
 option('pg-bell',
        type : 'boolean', value : true,
        description : 'should pg ring the bell on invalid keys?')
+option('colors-default', type: 'boolean', value: true,
+       description: 'Enables colorized output from utils by default')
 
 option('fs-search-path',
        type : 'string',

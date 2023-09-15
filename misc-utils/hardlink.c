@@ -36,6 +36,15 @@
 #include <signal.h>		/* SIG*, sigaction */
 #include <getopt.h>		/* getopt_long() */
 #include <ctype.h>		/* tolower() */
+#include <sys/ioctl.h>
+
+#if defined(HAVE_LINUX_FIEMAP_H) && defined(HAVE_SYS_VFS_H)
+# include <linux/fs.h>
+# include <linux/fiemap.h>
+# ifdef FICLONE
+#  define USE_REFLINK 1
+# endif
+#endif
 
 #include "nls.h"
 #include "c.h"
@@ -43,14 +52,33 @@
 #include "strutils.h"
 #include "monotonic.h"
 #include "optutils.h"
+#include "fileeq.h"
 
-#include <regex.h>		/* regcomp(), regsearch() */
+#ifdef USE_REFLINK
+# include "statfs_magic.h"
+#endif
 
-#ifdef HAVE_SYS_XATTR_H
-# include <sys/xattr.h>		/* listxattr, getxattr */
+#include <regex.h>		/* regcomp(), regexec() */
+
+#if defined(HAVE_SYS_XATTR_H) && defined(HAVE_LLISTXATTR) && defined(HAVE_LGETXATTR)
+# include <sys/xattr.h>
+# define USE_XATTR 1
 #endif
 
 static int quiet;		/* don't print anything */
+static int rootbasesz;		/* size of the directory for nftw() */
+
+#ifdef USE_REFLINK
+enum {
+	REFLINK_NEVER  = 0,
+	REFLINK_AUTO,
+	REFLINK_ALWAYS
+};
+static int reflink_mode = REFLINK_NEVER;
+static int reflinks_skip;
+#endif
+
+static struct ul_fileeq fileeq;
 
 /**
  * struct file - Information about a file
@@ -63,10 +91,13 @@ static int quiet;		/* don't print anything */
  */
 struct file {
 	struct stat st;
+	struct ul_fileeq_data data;
+
 	struct file *next;
 	struct link {
 		struct link *next;
 		int basename;
+		int dirname;
 #if __STDC_VERSION__ >= 199901L
 		char path[];
 #elif __GNUC__
@@ -107,6 +138,7 @@ static struct statistics {
 	size_t linked;
 	size_t xattr_comparisons;
 	size_t comparisons;
+	size_t ignored_reflinks;
 	double saved;
 	struct timeval start_time;
 } stats;
@@ -133,15 +165,18 @@ struct hdl_regex {
  * @keep_oldest: Choose the file with oldest timestamp as master (default = FALSE)
  * @dry_run: Specifies whether hardlink should not link files (default = FALSE)
  * @min_size: Minimum size of files to consider. (default = 1 byte)
+ * @max_size: Maximum size of files to consider, 0 means umlimited. (default = 0 byte)
  */
 static struct options {
 	struct hdl_regex *include;
 	struct hdl_regex *exclude;
 
+	const char *method;
 	signed int verbosity;
 	unsigned int respect_mode:1;
 	unsigned int respect_owner:1;
 	unsigned int respect_name:1;
+	unsigned int respect_dir:1;
 	unsigned int respect_time:1;
 	unsigned int respect_xattrs:1;
 	unsigned int maximise:1;
@@ -149,14 +184,23 @@ static struct options {
 	unsigned int keep_oldest:1;
 	unsigned int dry_run:1;
 	uintmax_t min_size;
+	uintmax_t max_size;
+	size_t io_size;
+	size_t cache_size;
 } opts = {
 	/* default setting */
+#ifdef USE_FILEEQ_CRYPTOAPI
+	.method = "sha256",
+#else
+	.method = "memcmp",
+#endif
 	.respect_mode = TRUE,
 	.respect_owner = TRUE,
 	.respect_time = TRUE,
 	.respect_xattrs = FALSE,
 	.keep_oldest = FALSE,
-	.min_size = 1
+	.min_size = 1,
+	.cache_size = 10*1024*1024
 };
 
 /*
@@ -174,7 +218,10 @@ static void *files_by_ino;
  * The last signal we received. We store the signal here in order to be able
  * to break out of loops gracefully and to return from our nftw() handler.
  */
-static int last_signal;
+static volatile sig_atomic_t last_signal;
+
+
+#define is_log_enabled(_level)  (quiet == 0 && (_level) <= (unsigned int)opts.verbosity)
 
 /**
  * jlog - Logging for hardlink
@@ -186,7 +233,7 @@ static void jlog(enum log_level level, const char *format, ...)
 {
 	va_list args;
 
-	if (quiet || level > (unsigned int)opts.verbosity)
+	if (!is_log_enabled(level))
 		return;
 
 	va_start(args, format);
@@ -266,6 +313,41 @@ static int compare_nodes(const void *_a, const void *_b)
 	return diff;
 }
 
+/* Compare only filenames */
+static inline int filename_strcmp(const struct file *a, const struct file *b)
+{
+	return strcmp(	a->links->path + a->links->basename,
+			b->links->path + b->links->basename);
+}
+
+/**
+ * Compare only directory names (ignores root directory and basename (filename))
+ *
+ * The complete path conrains three fragments:
+ *
+ * <rootdir> is specified on hardlink command line
+ * <dirname> is all betweehn rootdir and filename
+ * <filename> is last component (aka basename)
+ */
+static inline int dirname_strcmp(const struct file *a, const struct file *b)
+{
+	int diff = 0;
+	int asz = a->links->basename - a->links->dirname,
+	    bsz = b->links->basename - b->links->dirname;
+
+	diff = CMP(asz, bsz);
+
+	if (diff == 0) {
+		const char *a_start, *b_start;
+
+		a_start = a->links->path + a->links->dirname;
+		b_start = b->links->path + b->links->dirname;
+
+		diff = strncmp(a_start, b_start, asz);
+	}
+	return diff;
+}
+
 /**
  * compare_nodes_ino - Node comparison function
  * @_a: The first node (a #struct file)
@@ -288,8 +370,9 @@ static int compare_nodes_ino(const void *_a, const void *_b)
 	 * contain only links with the same basename to keep the rest simple.
 	 */
 	if (diff == 0 && opts.respect_name)
-		diff = strcmp(a->links->path + a->links->basename,
-			      b->links->path + b->links->basename);
+		diff = filename_strcmp(a, b);
+	if (diff == 0 && opts.respect_dir)
+		diff = dirname_strcmp(a, b);
 
 	return diff;
 }
@@ -305,26 +388,31 @@ static void print_stats(void)
 	gettime_monotonic(&end);
 	timersub(&end, &stats.start_time, &delta);
 
-	jlog(JLOG_SUMMARY, "%-15s %s", _("Mode:"),
+	jlog(JLOG_SUMMARY, "%-25s %s", _("Mode:"),
 	     opts.dry_run ? _("dry-run") : _("real"));
-	jlog(JLOG_SUMMARY, "%-15s %zu", _("Files:"), stats.files);
-	jlog(JLOG_SUMMARY, _("%-15s %zu files"), _("Linked:"), stats.linked);
+	jlog(JLOG_SUMMARY, "%-25s %s", _("Method:"), opts.method);
+	jlog(JLOG_SUMMARY, "%-25s %zu", _("Files:"), stats.files);
+	jlog(JLOG_SUMMARY, _("%-25s %zu files"), _("Linked:"), stats.linked);
 
-#ifdef HAVE_SYS_XATTR_H
-	jlog(JLOG_SUMMARY, _("%-15s %zu xattrs"), _("Compared:"),
+#ifdef USE_XATTR
+	jlog(JLOG_SUMMARY, _("%-25s %zu xattrs"), _("Compared:"),
 	     stats.xattr_comparisons);
 #endif
-	jlog(JLOG_SUMMARY, _("%-15s %zu files"), _("Compared:"),
+	jlog(JLOG_SUMMARY, _("%-25s %zu files"), _("Compared:"),
 	     stats.comparisons);
-
+#ifdef USE_REFLINK
+	if (reflinks_skip)
+		jlog(JLOG_SUMMARY, _("%-25s %zu files"), _("Skipped reflinks:"),
+		     stats.ignored_reflinks);
+#endif
 	ssz = size_to_human_string(SIZE_SUFFIX_3LETTER |
 				   SIZE_SUFFIX_SPACE |
 				   SIZE_DECIMAL_2DIGITS, stats.saved);
 
-	jlog(JLOG_SUMMARY, "%-15s %s", _("Saved:"), ssz);
+	jlog(JLOG_SUMMARY, "%-25s %s", _("Saved:"), ssz);
 	free(ssz);
 
-	jlog(JLOG_SUMMARY, _("%-15s %"PRId64".%06"PRId64" seconds"), _("Duration:"),
+	jlog(JLOG_SUMMARY, _("%-25s %"PRId64".%06"PRId64" seconds"), _("Duration:"),
 	     (int64_t)delta.tv_sec, (int64_t)delta.tv_usec);
 }
 
@@ -349,7 +437,7 @@ static int handle_interrupt(void)
 	return FALSE;
 }
 
-#ifdef HAVE_SYS_XATTR_H
+#ifdef USE_XATTR
 
 /**
  * llistxattr_or_die - Wrapper for llistxattr()
@@ -534,91 +622,20 @@ static int file_xattrs_equal(const struct file *a, const struct file *b)
 	free(value_b);
 	return ret;
 }
-#else /* !HAVE_SYS_XATTR_H */
+#else /* !USE_XATTR */
 static int file_xattrs_equal(const struct file *a, const struct file *b)
 {
 	return TRUE;
 }
-#endif /* HAVE_SYS_XATTR_H */
-
-/**
- * file_contents_equal - Compare contents of two files for equality
- * @a: The first file
- * @b: The second file
- *
- * Compare the contents of the files for equality
- */
-static int file_contents_equal(const struct file *a, const struct file *b)
-{
-	FILE *fa = NULL;
-	FILE *fb = NULL;
-	char buf_a[8192];
-	char buf_b[8192];
-	int cmp = 0;		/* zero => equal */
-	off_t off = 0;		/* current offset */
-
-	assert(a->links != NULL);
-	assert(b->links != NULL);
-
-	jlog(JLOG_VERBOSE1, _("Comparing %s to %s"), a->links->path,
-	     b->links->path);
-
-	stats.comparisons++;
-
-	if ((fa = fopen(a->links->path, "rb")) == NULL)
-		goto err;
-	if ((fb = fopen(b->links->path, "rb")) == NULL)
-		goto err;
-
-#if defined(POSIX_FADV_SEQUENTIAL) && defined(HAVE_POSIX_FADVISE)
-	posix_fadvise(fileno(fa), 0, 0, POSIX_FADV_SEQUENTIAL);
-	posix_fadvise(fileno(fb), 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
-
-	while (!handle_interrupt() && cmp == 0) {
-		size_t ca;
-		size_t cb;
-
-		ca = fread(buf_a, 1, sizeof(buf_a), fa);
-		if (ca < sizeof(buf_a) && ferror(fa))
-			goto err;
-
-		cb = fread(buf_b, 1, sizeof(buf_b), fb);
-		if (cb < sizeof(buf_b) && ferror(fb))
-			goto err;
-
-		off += ca;
-
-		if ((ca != cb || ca == 0)) {
-			cmp = CMP(ca, cb);
-			break;
-		}
-		cmp = memcmp(buf_a, buf_b, ca);
-	}
- out:
-	if (fa != NULL)
-		fclose(fa);
-	if (fb != NULL)
-		fclose(fb);
-	return !handle_interrupt() && cmp == 0;
- err:
-	if (fa == NULL || fb == NULL)
-		warn(_("cannot open %s"), fa ? b->links->path : a->links->path);
-	else
-		warn(_("cannot read %s"),
-		     ferror(fa) ? a->links->path : b->links->path);
-	cmp = 1;
-	goto out;
-}
+#endif /* USE_XATTR */
 
 /**
  * file_may_link_to - Check whether a file may replace another one
  * @a: The first file
  * @b: The second file
  *
- * Check whether the two fies are considered equal and can be linked
- * together. If the two files are identical, the result will be FALSE,
- * as replacing a link with an identical one is stupid.
+ * Check whether the two files are considered equal attributes and can be
+ * linked. This function does not compare content od the files!
  */
 static int file_may_link_to(const struct file *a, const struct file *b)
 {
@@ -631,11 +648,9 @@ static int file_may_link_to(const struct file *a, const struct file *b)
 		(!opts.respect_owner || a->st.st_uid == b->st.st_uid) &&
 		(!opts.respect_owner || a->st.st_gid == b->st.st_gid) &&
 		(!opts.respect_time || a->st.st_mtime == b->st.st_mtime) &&
-		(!opts.respect_name
-		 || strcmp(a->links->path + a->links->basename,
-			   b->links->path + b->links->basename) == 0) &&
-		(!opts.respect_xattrs || file_xattrs_equal(a, b)) &&
-		file_contents_equal(a, b));
+		(!opts.respect_name || filename_strcmp(a, b) == 0) &&
+		(!opts.respect_dir || dirname_strcmp(a, b) == 0) &&
+		(!opts.respect_xattrs || file_xattrs_equal(a, b)));
 }
 
 /**
@@ -666,6 +681,53 @@ static int file_compare(const struct file *a, const struct file *b)
 	return res;
 }
 
+#ifdef USE_REFLINK
+static inline int do_link(struct file *a, struct file *b,
+			  const char *new_name, int reflink)
+{
+	if (reflink) {
+		int dest = -1, src = -1;
+
+		dest = open(new_name, O_CREAT|O_WRONLY|O_TRUNC, 0600);
+		if (dest < 0)
+			goto fallback;
+		if (fchmod(dest, b->st.st_mode) != 0)
+			goto fallback;
+		if (fchown(dest, b->st.st_uid, b->st.st_gid) != 0)
+			goto fallback;
+		src = open(a->links->path, O_RDONLY);
+		if (src < 0)
+			goto fallback;
+		if (ioctl(dest, FICLONE, src) != 0)
+			goto fallback;
+		close(dest);
+		close(src);
+		return 0;
+fallback:
+		if (dest >= 0) {
+			close(dest);
+			unlink(new_name);
+		}
+		if (src >= 0)
+			close(src);
+
+		if (reflink_mode == REFLINK_ALWAYS)
+			return -errno;
+		jlog(JLOG_VERBOSE2,_("Reflinking failed, fallback to hardlinking"));
+	}
+
+	return link(a->links->path, new_name);
+}
+#else
+static inline int do_link(struct file *a,
+			  struct file *b __attribute__((__unused__)),
+			  const char *new_name,
+			  int reflink __attribute__((__unused__)))
+{
+	return link(a->links->path, new_name);
+}
+#endif /* USE_REFLINK */
+
 /**
  * file_link - Replace b with a link to a
  * @a: The first file
@@ -675,43 +737,43 @@ static int file_compare(const struct file *a, const struct file *b)
  * linked to a temporary name, and then renamed to the name of @b, making
  * the replace atomic (@b will always exist).
  */
-static int file_link(struct file *a, struct file *b)
+static int file_link(struct file *a, struct file *b, int reflink)
 {
-	char *ssz;
 
  file_link:
 	assert(a->links != NULL);
 	assert(b->links != NULL);
 
-	ssz = size_to_human_string(SIZE_SUFFIX_3LETTER |
+	if (is_log_enabled(JLOG_INFO)) {
+		char *ssz = size_to_human_string(SIZE_SUFFIX_3LETTER |
 				   SIZE_SUFFIX_SPACE |
 				   SIZE_DECIMAL_2DIGITS, a->st.st_size);
-	jlog(JLOG_INFO, _("%sLinking %s to %s (-%s)"),
-	     opts.dry_run ? _("[DryRun] ") : "", a->links->path, b->links->path,
-	     ssz);
-	free(ssz);
+		jlog(JLOG_INFO, _("%s%sLinking %s to %s (-%s)"),
+		     opts.dry_run ? _("[DryRun] ") : "",
+		     reflink ? "Ref" : "",
+		     a->links->path, b->links->path,
+		     ssz);
+		free(ssz);
+	}
 
 	if (!opts.dry_run) {
-		size_t len =
-		    strlen(b->links->path) + strlen(".hardlink-temporary") + 1;
-		char *new_path = xmalloc(len);
+		char *new_path;
+		int failed = 1;
 
-		snprintf(new_path, len, "%s.hardlink-temporary",
-			 b->links->path);
+		xasprintf(&new_path, "%s.hardlink-temporary", b->links->path);
 
-		if (link(a->links->path, new_path) != 0) {
-			warn(_("cannot link %s to %s"), a->links->path,
-			     new_path);
-			free(new_path);
-			return FALSE;
-		} else if (rename(new_path, b->links->path) != 0) {
-			warn(_("cannot rename %s to %s"), a->links->path,
-			     new_path);
-			unlink(new_path);	/* cleanup failed rename */
-			free(new_path);
-			return FALSE;
-		}
+		if (do_link(a, b, new_path, reflink) != 0)
+			warn(_("cannot link %s to %s"), a->links->path, new_path);
+
+		else if (rename(new_path, b->links->path) != 0) {
+			warn(_("cannot rename %s to %s"), a->links->path, new_path);
+			unlink(new_path);
+		} else
+			failed = 0;
+
 		free(new_path);
+		if (failed)
+			return FALSE;
 	}
 
 	/* Update statistics */
@@ -739,6 +801,19 @@ static int file_link(struct file *a, struct file *b)
 
 	return TRUE;
 }
+
+static int has_fpath(struct file *node, const char *path)
+{
+	struct link *l;
+
+	for (l = node->links; l; l = l->next) {
+		if (strcmp(l->path, path) == 0)
+			return 1;
+	}
+
+	return 0;
+}
+
 
 /**
  * inserter - Callback function for nftw()
@@ -781,7 +856,15 @@ static int inserter(const char *fpath, const struct stat *sb,
 		return 0;
 	}
 
-	jlog(JLOG_VERBOSE2, _("Visiting %s (file %zu)"), fpath, stats.files);
+	jlog(JLOG_VERBOSE2, " %5zu: [%" PRIu64 "/%" PRIu64 "/%zu] %s",
+			stats.files, sb->st_dev, sb->st_ino,
+			(size_t) sb->st_nlink, fpath);
+
+	if ((opts.max_size > 0) && ((uintmax_t) sb->st_size > opts.max_size)) {
+		jlog(JLOG_VERBOSE1,
+		     _("Skipped %s (greater than configured size)"), fpath);
+		return 0;
+	}
 
 	pathlen = strlen(fpath) + 1;
 
@@ -790,6 +873,7 @@ static int inserter(const char *fpath, const struct stat *sb,
 
 	fil->st = *sb;
 	fil->links->basename = ftwbuf->base;
+	fil->links->dirname = rootbasesz;
 	fil->links->next = NULL;
 
 	memcpy(fil->links->path, fpath, pathlen);
@@ -804,8 +888,14 @@ static int inserter(const char *fpath, const struct stat *sb,
 		assert((*node)->st.st_dev == sb->st_dev);
 		assert((*node)->st.st_ino == sb->st_ino);
 
-		fil->links->next = (*node)->links;
-		(*node)->links = fil->links;
+		if (has_fpath(*node, fpath)) {
+			jlog(JLOG_VERBOSE1,
+				_("Skipped %s (specified more than once)"), fpath);
+			free(fil->links);
+		} else {
+			fil->links->next = (*node)->links;
+			(*node)->links = fil->links;
+		}
 
 		free(fil);
 	} else {
@@ -843,6 +933,107 @@ static int inserter(const char *fpath, const struct stat *sb,
 	return 0;
 }
 
+#ifdef USE_REFLINK
+static int is_reflink_compatible(dev_t devno, const char *filename)
+{
+	static dev_t last_dev = 0;
+	static int last_status = 0;
+
+	if (last_dev != devno) {
+		struct statfs vfs;
+
+		if (statfs(filename, &vfs) != 0)
+			return 0;
+
+		last_dev = devno;
+		switch (vfs.f_type) {
+			case STATFS_BTRFS_MAGIC:
+			case STATFS_XFS_MAGIC:
+				last_status = 1;
+				break;
+			default:
+				last_status = 0;
+				break;
+		}
+	}
+
+	return last_status;
+}
+
+static int is_reflink(struct file *xa, struct file *xb)
+{
+	int last = 0, rc = 0;
+	char abuf[BUFSIZ] = { 0 },
+	     bbuf[BUFSIZ] = { 0 };
+
+	struct fiemap *amap = (struct fiemap *) abuf,
+		      *bmap = (struct fiemap *) bbuf;
+
+	int af = open(xa->links->path, O_RDONLY),
+	    bf = open(xb->links->path, O_RDONLY);
+
+	if (af < 0 || bf < 0)
+		goto done;
+
+	do {
+		size_t i;
+
+		amap->fm_length = ~0ULL;
+		amap->fm_flags = FIEMAP_FLAG_SYNC;
+		amap->fm_extent_count =	(sizeof(abuf) - sizeof(*amap)) / sizeof(struct fiemap_extent);
+
+		bmap->fm_length = ~0ULL;
+		bmap->fm_flags = FIEMAP_FLAG_SYNC;
+		bmap->fm_extent_count =	(sizeof(bbuf) - sizeof(*bmap)) / sizeof(struct fiemap_extent);
+
+		if (ioctl(af, FS_IOC_FIEMAP, (unsigned long) amap) < 0)
+			goto done;
+		if (ioctl(bf, FS_IOC_FIEMAP, (unsigned long) bmap) < 0)
+			goto done;
+
+		if (amap->fm_mapped_extents != bmap->fm_mapped_extents)
+			goto done;
+
+		for (i = 0; i < amap->fm_mapped_extents; i++) {
+			struct fiemap_extent *a = &amap->fm_extents[i];
+			struct fiemap_extent *b = &bmap->fm_extents[i];
+
+			if (a->fe_logical != b->fe_logical ||
+			    a->fe_length !=  b->fe_length ||
+			    a->fe_physical != b->fe_physical)
+				goto done;
+			if (!(a->fe_flags & FIEMAP_EXTENT_SHARED) ||
+			    !(b->fe_flags & FIEMAP_EXTENT_SHARED))
+				goto done;
+			if (a->fe_flags & FIEMAP_EXTENT_LAST)
+				last = 1;
+		}
+
+		bmap->fm_start = amap->fm_start =
+			amap->fm_extents[amap->fm_mapped_extents - 1].fe_logical +
+			amap->fm_extents[amap->fm_mapped_extents - 1].fe_length;
+	} while (last == 0);
+
+	rc = 1;
+done:
+	if (af >= 0)
+		close(af);
+	if (bf >= 0)
+		close(bf);
+	return rc;
+}
+#endif /* USE_REFLINK */
+
+static inline size_t count_nodes(struct file *x)
+{
+	size_t ct = 0;
+
+	for ( ; x !=  NULL; x = x->next)
+		ct++;
+
+	return ct;
+}
+
 /**
  * visitor - Callback for twalk()
  * @nodep: Pointer to a pointer to a #struct file
@@ -856,6 +1047,7 @@ static int inserter(const char *fpath, const struct stat *sb,
 static void visitor(const void *nodep, const VISIT which, const int depth)
 {
 	struct file *master = *(struct file **)nodep;
+	struct file *begin = master;
 	struct file *other;
 
 	(void)depth;
@@ -864,25 +1056,93 @@ static void visitor(const void *nodep, const VISIT which, const int depth)
 		return;
 
 	for (; master != NULL; master = master->next) {
+		size_t nnodes, memsiz;
+		int may_reflink = 0;
+
 		if (handle_interrupt())
 			exit(EXIT_FAILURE);
 		if (master->links == NULL)
 			continue;
 
+		/* calculate per file max memory use */
+		nnodes = count_nodes(master);
+		if (!nnodes)
+			continue;
+
+		/* per-file cache size */
+		memsiz = opts.cache_size / nnodes;
+		/*                                filesiz,      readsiz,      memsiz */
+		ul_fileeq_set_size(&fileeq, master->st.st_size, opts.io_size, memsiz);
+
+#ifdef USE_REFLINK
+		if (reflink_mode || reflinks_skip) {
+			may_reflink =
+				reflink_mode == REFLINK_ALWAYS ? 1 :
+				is_reflink_compatible(master->st.st_dev,
+							    master->links->path);
+		}
+#endif
 		for (other = master->next; other != NULL; other = other->next) {
+			int eq;
+
 			if (handle_interrupt())
 				exit(EXIT_FAILURE);
 
 			assert(other != other->next);
 			assert(other->st.st_size == master->st.st_size);
 
-			if (other->links == NULL
-			    || !file_may_link_to(master, other))
+			if (!other->links)
 				continue;
 
-			if (!file_link(master, other) && errno == EMLINK)
+			/* check file attributes, etc. */
+			if (!file_may_link_to(master, other)) {
+				jlog(JLOG_VERBOSE2,
+				     _("Skipped (attributes mismatch) %s"), other->links->path);
+				continue;
+			}
+#ifdef USE_REFLINK
+			if (may_reflink && reflinks_skip && is_reflink(master, other)) {
+				jlog(JLOG_VERBOSE2,
+				     _("Skipped (already reflink) %s"), other->links->path);
+				stats.ignored_reflinks++;
+				continue;
+			}
+#endif
+			/* initialize content comparison */
+			if (!ul_fileeq_data_associated(&master->data))
+				ul_fileeq_data_set_file(&master->data, master->links->path);
+			if (!ul_fileeq_data_associated(&other->data))
+				ul_fileeq_data_set_file(&other->data, other->links->path);
+
+			/* compare files */
+			eq = ul_fileeq(&fileeq, &master->data, &other->data);
+
+			/* reduce number of open files, keep only master open */
+			ul_fileeq_data_close_file(&other->data);
+
+			stats.comparisons++;
+
+			if (!eq) {
+				jlog(JLOG_VERBOSE2,
+				     _("Skipped (content mismatch) %s"), other->links->path);
+				continue;
+			}
+
+			/* link files */
+			if (!file_link(master, other, may_reflink) && errno == EMLINK) {
+				ul_fileeq_data_deinit(&master->data);
 				master = other;
+			}
 		}
+
+		/* don't keep master data in memory */
+		ul_fileeq_data_deinit(&master->data);
+	}
+
+	/* final cleanup */
+	for (other = begin; other != NULL; other = other->next) {
+		if (ul_fileeq_data_associated(&other->data))
+			ul_fileeq_data_deinit(&other->data);
 	}
 }
 
@@ -901,33 +1161,42 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_("Consolidate duplicate files using hardlinks.\n"), out);
 
 	fputs(USAGE_OPTIONS, out);
-	fputs(_(" -v, --verbose              verbose output (repeat for more verbosity)\n"), out);
-	fputs(_(" -q, --quiet                quiet mode - don't print anything\n"), out);
-	fputs(_(" -n, --dry-run              don't actually link anything\n"), out);
+	fputs(_(" -c, --content              compare only file contents, same as -pot\n"), out);
+	fputs(_(" -b, --io-size <size>       I/O buffer size for file reading\n"
+	        "                              (speedup, using more RAM)\n"), out);
+	fputs(_(" -d, --respect-dir          directory names have to be identical\n"), out);
 	fputs(_(" -f, --respect-name         filenames have to be identical\n"), out);
-	fputs(_(" -p, --ignore-mode          ignore changes of file mode\n"), out);
-	fputs(_(" -o, --ignore-owner         ignore owner changes\n"), out);
-	fputs(_(" -t, --ignore-time          ignore timestamps (when testing for equality)\n"), out);
-#ifdef HAVE_SYS_XATTR_H
-	fputs(_(" -X, --respect-xattrs       respect extended attributes\n"), out);
-#endif
+	fputs(_(" -i, --include <regex>      regular expression to include files/dirs\n"), out);
 	fputs(_(" -m, --maximize             maximize the hardlink count, remove the file with\n"
 	        "                              lowest hardlink count\n"), out);
 	fputs(_(" -M, --minimize             reverse the meaning of -m\n"), out);
+	fputs(_(" -n, --dry-run              don't actually link anything\n"), out);
+	fputs(_(" -o, --ignore-owner         ignore owner changes\n"), out);
 	fputs(_(" -O, --keep-oldest          keep the oldest file of multiple equal files\n"
 		"                              (lower precedence than minimize/maximize)\n"), out);
-	fputs(_(" -x, --exclude <regex>      regular expression to exclude files\n"), out);
-	fputs(_(" -i, --include <regex>      regular expression to include files/dirs\n"), out);
+	fputs(_(" -p, --ignore-mode          ignore changes of file mode\n"), out);
+	fputs(_(" -q, --quiet                quiet mode - don't print anything\n"), out);
+	fputs(_(" -r, --cache-size <size>    memory limit for cached file content data\n"), out);
 	fputs(_(" -s, --minimum-size <size>  minimum size for files.\n"), out);
-	fputs(_(" -c, --content              compare only file contents, same as -pot\n"), out);
+	fputs(_(" -S, --maximum-size <size>  maximum size for files.\n"), out);
+	fputs(_(" -t, --ignore-time          ignore timestamps (when testing for equality)\n"), out);
+	fputs(_(" -v, --verbose              verbose output (repeat for more verbosity)\n"), out);
+	fputs(_(" -x, --exclude <regex>      regular expression to exclude files\n"), out);
+#ifdef USE_XATTR
+	fputs(_(" -X, --respect-xattrs       respect extended attributes\n"), out);
+#endif
+	fputs(_(" -y, --method <name>        file content comparison method\n"), out);
 
+#ifdef USE_REFLINK
+	fputs(_("     --reflink[=<when>]     create clone/CoW copies (auto, always, never)\n"), out);
+	fputs(_("     --skip-reflinks        skip already cloned files (enabled on --reflink)\n"), out);
+#endif
 	fputs(USAGE_SEPARATOR, out);
 	printf(USAGE_HELP_OPTIONS(28));
 	printf(USAGE_MAN_TAIL("hardlink(1)"));
 
 	exit(EXIT_SUCCESS);
 }
-
 
 /**
  * parse_options - Parse the command line options
@@ -936,13 +1205,18 @@ static void __attribute__((__noreturn__)) usage(void)
  */
 static int parse_options(int argc, char *argv[])
 {
-	static const char optstr[] = "VhvnfpotXcmMOx:i:s:q";
+	enum {
+		OPT_REFLINK = CHAR_MAX + 1,
+		OPT_SKIP_RELINKS
+	};
+	static const char optstr[] = "VhvndfpotXcmMOx:y:i:r:S:s:b:q";
 	static const struct option long_options[] = {
 		{"version", no_argument, NULL, 'V'},
 		{"help", no_argument, NULL, 'h'},
 		{"verbose", no_argument, NULL, 'v'},
 		{"dry-run", no_argument, NULL, 'n'},
 		{"respect-name", no_argument, NULL, 'f'},
+		{"respect-dir", no_argument, NULL, 'd'},
 		{"ignore-mode", no_argument, NULL, 'p'},
 		{"ignore-owner", no_argument, NULL, 'o'},
 		{"ignore-time", no_argument, NULL, 't'},
@@ -952,9 +1226,17 @@ static int parse_options(int argc, char *argv[])
 		{"keep-oldest", no_argument, NULL, 'O'},
 		{"exclude", required_argument, NULL, 'x'},
 		{"include", required_argument, NULL, 'i'},
+		{"method", required_argument, NULL, 'y' },
 		{"minimum-size", required_argument, NULL, 's'},
+		{"maximum-size", required_argument, NULL, 'S'},
+#ifdef USE_REFLINK
+		{"reflink", optional_argument, NULL, OPT_REFLINK },
+		{"skip-reflinks", no_argument, NULL, OPT_SKIP_RELINKS },
+#endif
+		{"io-size", required_argument, NULL, 'b'},
 		{"content", no_argument, NULL, 'c'},
 		{"quiet", no_argument, NULL, 'q'},
+		{"cache-size", required_argument, NULL, 'r'},
 		{NULL, 0, NULL, 0}
 	};
 	static const ul_excl_t excl[] = {
@@ -962,7 +1244,7 @@ static int parse_options(int argc, char *argv[])
 		{0}
 	};
 	int excl_st[ARRAY_SIZE(excl)] = UL_EXCL_STATUS_INIT;
-	int c;
+	int c, content_only = 0;
 
 	while ((c = getopt_long(argc, argv, optstr, long_options, NULL)) != -1) {
 
@@ -993,6 +1275,9 @@ static int parse_options(int argc, char *argv[])
 		case 'f':
 			opts.respect_name = TRUE;
 			break;
+		case 'd':
+			opts.respect_dir = TRUE;
+			break;
 		case 'v':
 			opts.verbosity++;
 			break;
@@ -1000,11 +1285,7 @@ static int parse_options(int argc, char *argv[])
 			quiet = TRUE;
 			break;
 		case 'c':
-			opts.respect_mode = FALSE;
-			opts.respect_name = FALSE;
-			opts.respect_owner = FALSE;
-			opts.respect_time = FALSE;
-			opts.respect_xattrs = FALSE;
+			content_only = 1;
 			break;
 		case 'n':
 			opts.dry_run = 1;
@@ -1012,20 +1293,72 @@ static int parse_options(int argc, char *argv[])
 		case 'x':
 			register_regex(&opts.exclude, optarg);
 			break;
+		case 'y':
+			opts.method = optarg;
+			break;
 		case 'i':
 			register_regex(&opts.include, optarg);
 			break;
 		case 's':
-			opts.min_size = strtosize_or_err(optarg, _("failed to parse size"));
+			opts.min_size = strtosize_or_err(optarg, _("failed to parse minimum size"));
 			break;
+		case 'S':
+			opts.max_size = strtosize_or_err(optarg, _("failed to parse maximum size"));
+			break;
+		case 'r':
+			opts.cache_size = strtosize_or_err(optarg, _("failed to parse cache size"));
+			break;
+		case 'b':
+			opts.io_size = strtosize_or_err(optarg, _("failed to parse I/O size"));
+			break;
+#ifdef USE_REFLINK
+		case OPT_REFLINK:
+			reflink_mode = REFLINK_AUTO;
+			if (optarg) {
+				if (strcmp(optarg, "auto") == 0)
+					reflink_mode = REFLINK_AUTO;
+				else if (strcmp(optarg, "always") == 0)
+					reflink_mode = REFLINK_ALWAYS;
+				else if (strcmp(optarg, "never") == 0)
+					reflink_mode = REFLINK_NEVER;
+				else
+					errx(EXIT_FAILURE, _("unsupported reflink mode; %s"), optarg);
+			}
+			if (reflink_mode != REFLINK_NEVER)
+				reflinks_skip = 1;
+			break;
+		case OPT_SKIP_RELINKS:
+			reflinks_skip = 1;
+			break;
+#endif
 		case 'h':
 			usage();
 		case 'V':
-			print_version(EXIT_SUCCESS);
+		{
+			static const char *features[] = {
+#ifdef USE_REFLINK
+				"reflink",
+#endif
+#ifdef USE_FILEEQ_CRYPTOAPI
+				"cryptoapi",
+#endif
+				NULL
+			};
+			print_version_with_features(EXIT_SUCCESS, features);
+		}
 		default:
-			errtryhelp(EXIT_FAILURE);}
+			errtryhelp(EXIT_FAILURE);
+		}
 	}
 
+	if (content_only) {
+		opts.respect_mode = FALSE;
+		opts.respect_name = FALSE;
+		opts.respect_dir = FALSE;
+		opts.respect_owner = FALSE;
+		opts.respect_time = FALSE;
+		opts.respect_xattrs = FALSE;
+	}
 	return 0;
 }
 
@@ -1047,12 +1380,14 @@ static void sighandler(int i)
 	if (last_signal != SIGINT)
 		last_signal = i;
 	if (i == SIGINT)
-		putchar('\n');
+		/* can't use stdio on signal handler */
+		ignore_result(write(STDOUT_FILENO, "\n", sizeof("\n")-1));
 }
 
 int main(int argc, char *argv[])
 {
 	struct sigaction sa;
+	int rc;
 
 	sa.sa_handler = sighandler;
 	sa.sa_flags = SA_RESTART;
@@ -1062,8 +1397,10 @@ int main(int argc, char *argv[])
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGUSR1, &sa, NULL);
 
-	/* Pretty print numeric output */
-	setlocale(LC_NUMERIC, "");
+	/* Localize messages, number formatting, and anything else. */
+	setlocale(LC_ALL, "");
+	bindtextdomain(PACKAGE, LOCALEDIR);
+	textdomain(PACKAGE);
 
 	if (atexit(to_be_called_atexit) != 0)
 		err(EXIT_FAILURE, _("cannot register exit handler"));
@@ -1074,13 +1411,44 @@ int main(int argc, char *argv[])
 		errx(EXIT_FAILURE, _("no directory or file specified"));
 
 	gettime_monotonic(&stats.start_time);
+
+	rc = ul_fileeq_init(&fileeq, opts.method);
+	if (rc != 0 && strcmp(opts.method, "memcmp") != 0) {
+		jlog(JLOG_INFO, _("cannot initialize %s method, use 'memcmp' fallback"), opts.method);
+		opts.method = "memcmp";
+		rc = ul_fileeq_init(&fileeq, opts.method);
+	}
+	if (rc < 0)
+		err(EXIT_FAILURE, _("failed to initialize files comparior"));
+
+	/* defautl I/O size */
+	if (!opts.io_size) {
+		if (strcmp(opts.method, "memcmp") == 0)
+			opts.io_size = 8*1024;
+		else
+			opts.io_size = 1024*1024;
+	}
+
 	stats.started = TRUE;
 
+	jlog(JLOG_VERBOSE2, _("Scanning [device/inode/links]:"));
 	for (; optind < argc; optind++) {
-		if (nftw(argv[optind], inserter, 20, FTW_PHYS) == -1)
-			warn(_("cannot process %s"), argv[optind]);
+		char *path = realpath(argv[optind], NULL);
+
+		if (!path) {
+			warn(_("cannot get realpath: %s"), argv[optind]);
+			continue;
+		}
+		if (opts.respect_dir)
+			rootbasesz = strlen(path);
+		if (nftw(path, inserter, 20, FTW_PHYS) == -1)
+			warn(_("cannot process %s"), path);
+		free(path);
+		rootbasesz = 0;
 	}
 
 	twalk(files, visitor);
+
+	ul_fileeq_deinit(&fileeq);
 	return 0;
 }

@@ -56,11 +56,11 @@ Vertically align the modes and owners.
 *-x*, *--mountpoints*::
 Show mountpoint directories with a 'D' rather than a 'd'.
 
-*-V*, *--version*::
-Display version information and exit.
+*-Z*, *--context*::
+Show security context of the file or "?" if not available.
+The support for security contexts is optional and does not have to be compiled to the *namei* binary.
 
-*-h*, *--help*::
-Display help text and exit.
+include::man-common/help-version.adoc[]
 
 == BUGS
 

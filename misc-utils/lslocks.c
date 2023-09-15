@@ -44,7 +44,7 @@
 #include "list.h"
 #include "closestream.h"
 #include "optutils.h"
-#include "procutils.h"
+#include "procfs.h"
 
 /* column IDs */
 enum {
@@ -52,6 +52,8 @@ enum {
 	COL_PID,
 	COL_TYPE,
 	COL_SIZE,
+	COL_INODE,
+	COL_MAJMIN,
 	COL_MODE,
 	COL_M,
 	COL_START,
@@ -62,10 +64,10 @@ enum {
 
 /* column names */
 struct colinfo {
-	const char *name; /* header */
-	double	   whint; /* width hint (N < 1 is in percent of termwidth) */
-	int	   flags; /* SCOLS_FL_* */
-	const char *help;
+	const char * const	name; /* header */
+	double			whint; /* width hint (N < 1 is in percent of termwidth) */
+	int			flags; /* SCOLS_FL_* */
+	const char		*help;
 };
 
 /* columns descriptions */
@@ -74,6 +76,8 @@ static struct colinfo infos[] = {
 	[COL_PID]  = { "PID",     5, SCOLS_FL_RIGHT, N_("PID of the process holding the lock") },
 	[COL_TYPE] = { "TYPE",    5, SCOLS_FL_RIGHT, N_("kind of lock") },
 	[COL_SIZE] = { "SIZE",    4, SCOLS_FL_RIGHT, N_("size of the lock") },
+	[COL_INODE] = { "INODE",  5, SCOLS_FL_RIGHT, N_("inode number") },
+	[COL_MAJMIN] = { "MAJ:MIN", 6, 0, N_("major:minor device number") },
 	[COL_MODE] = { "MODE",    5, 0, N_("lock access mode") },
 	[COL_M]    = { "M",       1, 0, N_("mandatory state of the lock: 0 (none), 1 (set)")},
 	[COL_START] = { "START", 10, SCOLS_FL_RIGHT, N_("relative byte offset of the lock")},
@@ -106,6 +110,8 @@ struct lock {
 	char *mode;
 	off_t start;
 	off_t end;
+	ino_t inode;
+	dev_t dev;
 	unsigned int mandatory :1,
 		     blocked   :1;
 	uint64_t size;
@@ -172,12 +178,16 @@ static char *get_filename_sz(ino_t inode, pid_t lock_pid, size_t *size)
 	memset(path, 0, sizeof(path));
 	memset(sym, 0, sizeof(sym));
 
+	if (lock_pid < 0)
+		/* pid could be -1 for OFD locks */
+		return NULL;
+
 	/*
 	 * We know the pid so we don't have to
 	 * iterate the *entire* filesystem searching
 	 * for the damn file.
 	 */
-	sprintf(path, "/proc/%d/fd/", lock_pid);
+	snprintf(path, sizeof(path), "/proc/%d/fd/", lock_pid);
 	if (!(dirp = opendir(path)))
 		return NULL;
 
@@ -224,7 +234,8 @@ static ino_t get_dev_inode(char *str, dev_t *dev)
 	unsigned int maj = 0, min = 0;
 	ino_t inum = 0;
 
-	sscanf(str, "%02x:%02x:%ju", &maj, &min, &inum);
+	if (sscanf(str, "%x:%x:%ju", &maj, &min, &inum) != 3)
+		errx(EXIT_FAILURE, _("failed to parse '%s'"), str);
 
 	*dev = (dev_t) makedev(maj, min);
 	return inum;
@@ -233,12 +244,10 @@ static ino_t get_dev_inode(char *str, dev_t *dev)
 static int get_local_locks(struct list_head *locks)
 {
 	int i;
-	ino_t inode = 0;
 	FILE *fp;
 	char buf[PATH_MAX], *tok = NULL;
 	size_t sz;
 	struct lock *l;
-	dev_t dev = 0;
 
 	if (!(fp = fopen(_PATH_PROC_LOCKS, "r")))
 		return -1;
@@ -282,7 +291,7 @@ static int get_local_locks(struct list_head *locks)
 				 */
 				l->pid = strtos32_or_err(tok, _("failed to parse pid"));
 				if (l->pid > 0) {
-					l->cmdname = proc_get_command_name(l->pid);
+					l->cmdname = pid_get_cmdname(l->pid);
 					if (!l->cmdname)
 						l->cmdname = xstrdup(_("(unknown)"));
 				} else
@@ -290,7 +299,7 @@ static int get_local_locks(struct list_head *locks)
 				break;
 
 			case 5: /* device major:minor and inode number */
-				inode = get_dev_inode(tok, &dev);
+				l->inode = get_dev_inode(tok, &l->dev);
 				break;
 
 			case 6: /* start */
@@ -309,7 +318,7 @@ static int get_local_locks(struct list_head *locks)
 			}
 		}
 
-		l->path = get_filename_sz(inode, l->pid, &sz);
+		l->path = get_filename_sz(l->inode, l->pid, &sz);
 
 		/* no permissions -- ignore */
 		if (!l->path && no_inaccessible) {
@@ -319,7 +328,7 @@ static int get_local_locks(struct list_head *locks)
 
 		if (!l->path) {
 			/* probably no permission to peek into l->pid's path */
-			l->path = get_fallback_filename(dev);
+			l->path = get_fallback_filename(l->dev);
 			l->size = 0;
 		} else
 			l->size = sz;
@@ -357,7 +366,7 @@ static inline int get_column_id(int num)
 }
 
 
-static inline struct colinfo *get_column_info(unsigned num)
+static inline const struct colinfo *get_column_info(unsigned num)
 {
 	return &infos[ get_column_id(num) ];
 }
@@ -406,6 +415,15 @@ static void add_scols_line(struct libscols_table *table, struct lock *l, struct 
 			break;
 		case COL_TYPE:
 			xasprintf(&str, "%s", l->type);
+			break;
+		case COL_INODE:
+			xasprintf(&str, "%ju", (uintmax_t) l->inode);
+			break;
+		case COL_MAJMIN:
+			if (json || raw)
+				xasprintf(&str, "%u:%u", major(l->dev), minor(l->dev));
+			else
+				xasprintf(&str, "%3u:%-3u", major(l->dev), minor(l->dev));
 			break;
 		case COL_SIZE:
 			if (!l->size)
@@ -466,7 +484,7 @@ static int show_locks(struct list_head *locks)
 
 	for (i = 0; i < ncolumns; i++) {
 		struct libscols_column *cl;
-		struct colinfo *col = get_column_info(i);
+		const struct colinfo *col = get_column_info(i);
 
 		cl = scols_table_new_column(table, col->name, col->whint, col->flags);
 		if (!cl)
@@ -484,6 +502,7 @@ static int show_locks(struct list_head *locks)
 			case COL_START:
 			case COL_END:
 			case COL_BLOCKER:
+			case COL_INODE:
 				scols_column_set_json_type(cl, SCOLS_JSON_NUMBER);
 				break;
 			case COL_M:

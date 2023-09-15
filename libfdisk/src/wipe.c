@@ -75,6 +75,7 @@ int fdisk_set_wipe_area(struct fdisk_context *cxt,
 			free(wp);
 			return 1;
 		}
+		DBG(WIPE, ul_debug("not requested"));
 		return 0;
 	}
 
@@ -134,9 +135,11 @@ int fdisk_do_wipe(struct fdisk_context *cxt)
 		}
 
 		blkid_probe_enable_superblocks(pr, 1);
-		blkid_probe_set_superblocks_flags(pr, BLKID_SUBLKS_MAGIC);
+		blkid_probe_set_superblocks_flags(pr, BLKID_SUBLKS_MAGIC |
+						      BLKID_SUBLKS_BADCSUM);
 		blkid_probe_enable_partitions(pr, 1);
-		blkid_probe_set_partitions_flags(pr, BLKID_PARTS_MAGIC);
+		blkid_probe_set_partitions_flags(pr, BLKID_PARTS_MAGIC |
+				                     BLKID_PARTS_FORCE_GPT);
 
 		while (blkid_do_probe(pr) == 0) {
 			DBG(WIPE, ul_debugobj(wp, " wiping..."));
@@ -169,7 +172,7 @@ int fdisk_check_collisions(struct fdisk_context *cxt)
 	assert(cxt);
 	assert(cxt->dev_fd >= 0);
 
-	DBG(CXT, ul_debugobj(cxt, "wipe check: initialize libblkid prober"));
+	DBG(WIPE, ul_debugobj(cxt, "wipe check: initialize libblkid prober"));
 
 	pr = blkid_new_probe();
 	if (!pr)
@@ -183,8 +186,10 @@ int fdisk_check_collisions(struct fdisk_context *cxt)
 	cxt->collision = NULL;
 
 	blkid_probe_enable_superblocks(pr, 1);
-	blkid_probe_set_superblocks_flags(pr, BLKID_SUBLKS_TYPE);
+	blkid_probe_set_superblocks_flags(pr, BLKID_SUBLKS_TYPE |
+			                      BLKID_SUBLKS_BADCSUM);
 	blkid_probe_enable_partitions(pr, 1);
+	blkid_probe_set_partitions_flags(pr,  BLKID_PARTS_FORCE_GPT);
 
 	/* we care about the first found FS/raid, so don't call blkid_do_probe()
 	 * in loop or don't use blkid_do_fullprobe() ... */
@@ -204,6 +209,6 @@ int fdisk_check_collisions(struct fdisk_context *cxt)
 	}
 
 	blkid_free_probe(pr);
-	return rc;
+	return rc < 0 ? rc : cxt->collision ? 1 : 0;
 }
 #endif

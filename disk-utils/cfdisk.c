@@ -1,7 +1,7 @@
 /*
  * cfdisk.c - Display or manipulate a disk partition table.
  *
- *     Copyright (C) 2014-2015 Karel Zak <kzak@redhat.com>
+ *     Copyright (C) 2014-2023 Karel Zak <kzak@redhat.com>
  *     Copyright (C) 1994 Kevin E. Martin (martin@cs.unc.edu)
  *
  *     The original cfdisk was inspired by the fdisk program
@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <libsmartcols.h>
 #include <sys/ioctl.h>
+#include <rpmatch.h>
 #include <libfdisk.h>
 
 #ifdef HAVE_LIBMOUNT
@@ -124,12 +125,14 @@ enum {
 	CFDISK_CL_FREESPACE,
 	CFDISK_CL_INFO
 };
+#ifdef HAVE_USE_DEFAULT_COLORS
 static const int color_pairs[][2] = {
 	/* color            foreground, background */
 	[CFDISK_CL_WARNING]   = { COLOR_RED, -1 },
 	[CFDISK_CL_FREESPACE] = { COLOR_GREEN, -1 },
 	[CFDISK_CL_INFO]      = { COLOR_BLUE, -1 }
 };
+#endif
 
 struct cfdisk;
 
@@ -2080,7 +2083,7 @@ done:
 	}
 	free(cm);
 	DBG(UI, ul_debug("get parrtype done [type=%s] ", t ?
-				fdisk_parttype_get_name(t) : NULL));
+				fdisk_parttype_get_name(t) : ""));
 	return t;
 }
 
@@ -2254,7 +2257,8 @@ static int ui_help(void)
 		"  ",
 		N_("Command      Meaning"),
 		N_("-------      -------"),
-		N_("  b          Toggle bootable flag of the current partition"),
+		N_("  b          Toggle bootable flag of the current partition;"),
+		N_("               implemented for DOS (MBR) and SGI labels only"),
 		N_("  d          Delete the current partition"),
 		N_("  h          Print this screen"),
 		N_("  n          Create new partition from free space"),
@@ -2278,7 +2282,7 @@ static int ui_help(void)
 		N_("Use lsblk(8) or partx(8) to see more details about the device."),
 		"  ",
 		"  ",
-		"Copyright (C) 2014-2017 Karel Zak <kzak@redhat.com>"
+		"Copyright (C) 2014-2023 Karel Zak <kzak@redhat.com>"
 	};
 
 	erase();
@@ -2521,11 +2525,15 @@ static int main_menu_action(struct cfdisk *cf, int key)
 		if (rc)
 			warn = _("Failed to write disklabel.");
 		else {
+			size_t q_idx = 0;
+
 			if (cf->device_is_used)
 				fdisk_reread_changes(cf->cxt, cf->original_layout);
 			else
 				fdisk_reread_partition_table(cf->cxt);
 			info = _("The partition table has been altered.");
+			if (menu_get_menuitem_by_key(cf, 'q', &q_idx))
+				ui_menu_goto(cf, q_idx);
 		}
 		cf->nwrites++;
 		break;
@@ -2585,11 +2593,17 @@ static int ui_run(struct cfdisk *cf)
 	DBG(UI, ul_debug("start cols=%zu, lines=%zu", ui_cols, ui_lines));
 
 	if (fdisk_get_collision(cf->cxt)) {
-		ui_warnx(_("Device already contains a %s signature; it will be removed by a write command."),
-				fdisk_get_collision(cf->cxt));
-		fdisk_enable_wipe(cf->cxt, 1);
-		ui_hint(_("Press a key to continue."));
-		getch();
+		ui_warnx(_("Device already contains a %s signature."), fdisk_get_collision(cf->cxt));
+		if (fdisk_is_readonly(cf->cxt)) {
+			ui_hint(_("Press a key to continue."));
+			getch();
+		} else {
+			char buf[64] = { 0 };
+			rc = ui_get_string(_("Do you want to remove it? [Y]es/[N]o: "), NULL,
+					buf, sizeof(buf));
+			fdisk_enable_wipe(cf->cxt,
+					rc > 0 && rpmatch(buf) == RPMATCH_YES ? 1 : 0);
+		}
 	}
 
 	if (!fdisk_has_label(cf->cxt) || cf->zero_start) {

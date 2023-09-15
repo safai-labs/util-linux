@@ -1,9 +1,16 @@
 dir_libblkid = include_directories('.', 'src')
 
-blkid_h = configure_file(
+defs = configuration_data()
+defs.set('LIBBLKID_DATE', libblkid_date)
+defs.set('LIBBLKID_VERSION', pc_version)
+
+configure_file(
   input : 'src/blkid.h.in',
   output : 'blkid.h',
-  configuration : conf)
+  configuration : defs,
+  install : build_libblkid,
+  install_dir : join_paths(get_option('includedir'), 'blkid'),
+)
 
 lib_blkid_sources = '''
   src/blkidP.h
@@ -48,6 +55,7 @@ lib_blkid_sources = '''
   src/superblocks/bitlocker.c
   src/superblocks/bluestore.c
   src/superblocks/btrfs.c
+  src/superblocks/cs_fvault2.c
   src/superblocks/cramfs.c
   src/superblocks/ddf_raid.c
   src/superblocks/drbd.c
@@ -135,10 +143,16 @@ lib_blkid = both_libraries(
   link_with : lib_common,
   dependencies : build_libblkid ? [] : disabler(),
   install : build_libblkid)
+blkid_dep = declare_dependency(link_with: lib_blkid, include_directories: '.')
 
 lib_blkid_static = lib_blkid.get_static_lib()
 
-pkgconfig.generate(lib_blkid,
-                   description : 'Block device id library',
-                   subdirs : 'blkid',
-                   version : pc_version)
+if build_libblkid
+  pkgconfig.generate(lib_blkid,
+                     description : 'Block device id library',
+                     subdirs : 'blkid',
+                     version : pc_version)
+  if meson.version().version_compare('>=0.54.0')
+    meson.override_dependency('blkid', blkid_dep)
+  endif
+endif

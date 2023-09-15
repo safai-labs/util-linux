@@ -35,6 +35,7 @@
 #include "monotonic.h"
 #include "mangle.h"
 #include "pager.h"
+#include "jsonwrt.h"
 
 /* Close the log.  Currently a NOP. */
 #define SYSLOG_ACTION_CLOSE          0
@@ -124,6 +125,7 @@ static const struct dmesg_name level_names[] =
  * shifted code :-)
  */
 #define FAC_BASE(f)	((f) >> 3)
+#define LOG_RAW_FAC_PRI(fac, pri)	LOG_MAKEPRI((fac << 3), (pri))
 
 static const struct dmesg_name facility_names[] =
 {
@@ -169,7 +171,7 @@ struct dmesg_control {
 	struct timeval	lasttime;	/* last printed timestamp */
 	struct tm	lasttm;		/* last localtime */
 	struct timeval	boot_time;	/* system boot time */
-	time_t		suspended_time;	/* time spent in suspended state */
+	usec_t		suspended_time;	/* time spent in suspended state */
 
 	int		action;		/* SYSLOG_ACTION_* */
 	int		method;		/* DMESG_METHOD_* */
@@ -178,10 +180,16 @@ struct dmesg_control {
 
 	int		kmsg;		/* /dev/kmsg file descriptor */
 	ssize_t		kmsg_first_read;/* initial read() return code */
-	char		kmsg_buf[BUFSIZ];/* buffer to read kmsg data */
+	/*
+	 * the kernel will give EINVAL if we do read() on /proc/kmsg with
+	 * length insufficient for the next message. messages may be up to
+	 * PRINTK_MESSAGE_MAX, which is defined as 2048, so we must be
+	 * able to buffer at least that much in one call
+	 */
+	char		kmsg_buf[2048]; /* buffer to read kmsg data */
 
-	time_t		since;		/* filter records by time */
-	time_t		until;		/* filter records by time */
+	usec_t		since;		/* filter records by time */
+	usec_t		until;		/* filter records by time */
 
 	/*
 	 * For the --file option we mmap whole file. The unnecessary (already
@@ -193,6 +201,8 @@ struct dmesg_control {
 	size_t		pagesize;
 	unsigned int	time_fmt;	/* time format */
 
+	struct ul_jsonwrt jfmt;		/* -J formatting */
+
 	unsigned int	follow:1,	/* wait for new messages */
 			end:1,		/* seek to the of buffer */
 			raw:1,		/* raw mode */
@@ -202,6 +212,7 @@ struct dmesg_control {
 			decode:1,	/* use "facility: level: " prefix */
 			pager:1,	/* pipe output into a pager */
 			color:1,	/* colorize messages */
+			json:1,		/* JSON output */
 			force_prefix:1;	/* force timestamp and decode prefix
 					   on each line */
 	int		indent;		/* due to timestamps if newline */
@@ -228,7 +239,7 @@ struct dmesg_record {
 		(_r)->tv.tv_usec = 0; \
 	} while (0)
 
-static int read_kmsg(struct dmesg_control *ctl);
+static int process_kmsg(struct dmesg_control *ctl);
 
 static int set_level_color(int log_level, const char *mesg, size_t mesgsz)
 {
@@ -282,6 +293,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -F, --file <file>           use the file instead of the kernel log buffer\n"), out);
 	fputs(_(" -f, --facility <list>       restrict output to defined facilities\n"), out);
 	fputs(_(" -H, --human                 human readable output\n"), out);
+	fputs(_(" -J, --json                  use JSON output format\n"), out);
 	fputs(_(" -k, --kernel                display kernel messages\n"), out);
 	fprintf(out,
 	      _(" -L, --color[=<when>]        colorize messages (%s, %s or %s)\n"), "auto", "always", "never");
@@ -578,9 +590,9 @@ static ssize_t read_syslog_buffer(struct dmesg_control *ctl, char **buf)
 }
 
 /*
- * Top level function to read messages
+ * Top level function to read (and print in case of kmesg) messages
  */
-static ssize_t read_buffer(struct dmesg_control *ctl, char **buf)
+static ssize_t process_buffer(struct dmesg_control *ctl, char **buf)
 {
 	ssize_t n = -1;
 
@@ -598,7 +610,7 @@ static ssize_t read_buffer(struct dmesg_control *ctl, char **buf)
 		/*
 		 * Since kernel 3.5.0
 		 */
-		n = read_kmsg(ctl);
+		n = process_kmsg(ctl);
 		break;
 	default:
 		abort();	/* impossible method -> drop core */
@@ -742,7 +754,7 @@ static int get_next_syslog_record(struct dmesg_control *ctl,
 			continue;	/* error or empty line? */
 
 		if (*begin == '<') {
-			if (ctl->fltr_lev || ctl->fltr_fac || ctl->decode || ctl->color)
+			if (ctl->fltr_lev || ctl->fltr_fac || ctl->decode || ctl->color || ctl->json)
 				begin = parse_faclev(begin + 1, &rec->facility,
 						     &rec->level);
 			else
@@ -779,9 +791,11 @@ static int get_next_syslog_record(struct dmesg_control *ctl,
 	return 1;
 }
 
-static time_t record_time(struct dmesg_control *ctl, struct dmesg_record *rec)
+static usec_t record_time(struct dmesg_control *ctl, struct dmesg_record *rec)
 {
-	return ctl->boot_time.tv_sec + ctl->suspended_time + rec->tv.tv_sec;
+	return timeval_to_usec(&ctl->boot_time) +
+		ctl->suspended_time +
+		timeval_to_usec(&rec->tv);
 }
 
 static int accept_record(struct dmesg_control *ctl, struct dmesg_record *rec)
@@ -837,7 +851,7 @@ static struct tm *record_localtime(struct dmesg_control *ctl,
 				   struct dmesg_record *rec,
 				   struct tm *tm)
 {
-	time_t t = record_time(ctl, rec);
+	time_t t = record_time(ctl, rec) / USEC_PER_SEC;
 	return localtime_r(&t, tm);
 }
 
@@ -849,14 +863,21 @@ static char *record_ctime(struct dmesg_control *ctl,
 
 	record_localtime(ctl, rec, &tm);
 
-	if (strftime(buf, bufsiz, "%a %b %e %H:%M:%S %Y", &tm) == 0)
+	/* TRANSLATORS: dmesg uses strftime() fo generate date-time string
+	   where %a is abbreviated name of the day, %b is abbreviated month
+	   name and %e is day of the month as a decimal number. Please, set
+	   proper month/day order here */
+	if (strftime(buf, bufsiz, _("%a %b %e %H:%M:%S %Y"), &tm) == 0)
 		*buf = '\0';
 	return buf;
 }
 
 static char *short_ctime(struct tm *tm, char *buf, size_t bufsiz)
 {
-	if (strftime(buf, bufsiz, "%b%e %H:%M", tm) == 0)
+	/* TRANSLATORS: dmesg uses strftime() fo generate date-time string
+	   where: %b is abbreviated month and %e is day of the month as a
+	   decimal number. Please, set proper month/day order here. */
+	if (strftime(buf, bufsiz, _("%b%e %H:%M"), tm) == 0)
 		*buf = '\0';
 	return buf;
 }
@@ -864,10 +885,10 @@ static char *short_ctime(struct tm *tm, char *buf, size_t bufsiz)
 static char *iso_8601_time(struct dmesg_control *ctl, struct dmesg_record *rec,
 			   char *buf, size_t bufsz)
 {
-	struct timeval tv = {
-		.tv_sec = ctl->boot_time.tv_sec + ctl->suspended_time + rec->tv.tv_sec,
-		.tv_usec = rec->tv.tv_usec
-	};
+	struct timeval tv = usec_to_timeval(
+		timeval_to_usec(&ctl->boot_time) + ctl->suspended_time +
+		timeval_to_usec(&rec->tv)
+	);
 
 	if (strtimeval_iso(&tv,	ISO_TIMESTAMP_COMMA_T, buf, bufsz) != 0)
 		return NULL;
@@ -898,13 +919,19 @@ static const char *get_subsys_delimiter(const char *mesg, size_t mesg_size)
 			return NULL;
 		sz -= d - p + 1;
 		if (sz) {
-			if (isblank(*(d + 1)))
-				return d;
+			if (sz >= 2 && isblank(*(d + 1)))
+				return d + 2;
 			p = d + 1;
 		}
 	}
 	return NULL;
 }
+
+#define is_facpri_valid(_r)	\
+	    (((_r)->level > -1) && ((_r)->level < (int) ARRAY_SIZE(level_names)) && \
+	     ((_r)->facility > -1) && \
+	     ((_r)->facility < (int) ARRAY_SIZE(facility_names)))
+
 
 static void print_record(struct dmesg_control *ctl,
 			 struct dmesg_record *rec)
@@ -921,8 +948,18 @@ static void print_record(struct dmesg_control *ctl,
 		return;
 
 	if (!rec->mesg_size) {
-		putchar('\n');
+		if (!ctl->json)
+			putchar('\n');
 		return;
+	}
+
+	if (ctl->json) {
+		if (!ul_jsonwrt_is_ready(&ctl->jfmt)) {
+			ul_jsonwrt_init(&ctl->jfmt, stdout, 0);
+			ul_jsonwrt_root_open(&ctl->jfmt);
+			ul_jsonwrt_array_open(&ctl->jfmt, "dmesg");
+		}
+		ul_jsonwrt_object_open(&ctl->jfmt, NULL);
 	}
 
 	/*
@@ -932,17 +969,14 @@ static void print_record(struct dmesg_control *ctl,
 	if (ctl->raw) {
 		ctl->indent = snprintf(tsbuf, sizeof(tsbuf),
 				       "<%d>[%5ld.%06ld] ",
-				       LOG_MAKEPRI(rec->facility, rec->level),
+				       LOG_RAW_FAC_PRI(rec->facility, rec->level),
 				       (long) rec->tv.tv_sec,
 				       (long) rec->tv.tv_usec);
 		goto full_output;
 	}
 
 	/* Store decode information (facility & priority level) in a buffer */
-	if (ctl->decode &&
-	    (rec->level > -1) && (rec->level < (int) ARRAY_SIZE(level_names)) &&
-	    (rec->facility > -1) &&
-	    (rec->facility < (int) ARRAY_SIZE(facility_names)))
+	if (!ctl->json && ctl->decode && is_facpri_valid(rec))
 		snprintf(fpbuf, sizeof(fpbuf), "%-6s:%-6s: ",
 			 facility_names[rec->facility].name,
 			 level_names[rec->level].name);
@@ -988,7 +1022,8 @@ static void print_record(struct dmesg_control *ctl,
 		ctl->lasttm = cur;
 		break;
 	case DMESG_TIMEFTM_TIME:
-		ctl->indent = snprintf(tsbuf, sizeof(tsbuf), "[%5ld.%06ld] ",
+		ctl->indent = snprintf(tsbuf, sizeof(tsbuf),
+				      ctl->json ? "%5ld.%06ld" : "[%5ld.%06ld] ",
 				      (long)rec->tv.tv_sec,
 				      (long)rec->tv.tv_usec);
 		break;
@@ -1011,8 +1046,15 @@ static void print_record(struct dmesg_control *ctl,
 
 full_output:
 	/* Output the decode information */
-	if (*fpbuf)
+	if (*fpbuf) {
 		fputs(fpbuf, stdout);
+	} else if (ctl->json && is_facpri_valid(rec)) {
+		if (ctl->decode) {
+			ul_jsonwrt_value_s(&ctl->jfmt, "fac", facility_names[rec->facility].name);
+			ul_jsonwrt_value_s(&ctl->jfmt, "pri", level_names[rec->level].name);
+		} else
+			ul_jsonwrt_value_u64(&ctl->jfmt, "pri", LOG_RAW_FAC_PRI(rec->facility, rec->level));
+	}
 
 	/* Output the timestamp buffer */
 	if (*tsbuf) {
@@ -1021,17 +1063,17 @@ full_output:
 			dmesg_enable_color(timebreak ? DMESG_COLOR_TIMEBREAK :
 						       DMESG_COLOR_TIME);
 		if (ctl->time_fmt != DMESG_TIMEFTM_RELTIME) {
-			fputs(tsbuf, stdout);
+			if (ctl->json)
+				ul_jsonwrt_value_raw(&ctl->jfmt, "time", tsbuf);
+			else
+				fputs(tsbuf, stdout);
 		} else {
 			/*
 			 * For relative timestamping, the first line's
 			 * timestamp is the offset and all other lines will
 			 * report an offset of 0.000000.
 			 */
-			if (!line)
-				fputs(tsbuf, stdout);
-			else
-				printf("[  +0.000000] ");
+			fputs(!line ? tsbuf : "[  +0.000000] ", stdout);
 		}
 		if (ctl->color)
 			color_disable();
@@ -1074,8 +1116,12 @@ full_output:
 		safe_fwrite(ctl, line, mesg_size, ctl->indent, stdout);
 		if (has_color)
 			color_disable();
-	} else
-		safe_fwrite(ctl, line, mesg_size, ctl->indent, stdout);
+	} else {
+		if (ctl->json)
+			ul_jsonwrt_value_s(&ctl->jfmt, "msg", line);
+		else
+			safe_fwrite(ctl, line, mesg_size, ctl->indent, stdout);
+	}
 
 	/* Get the next line */
 	if (ctl->force_prefix) {
@@ -1089,7 +1135,10 @@ full_output:
 
 done:
 	free(mesg_copy);
-	putchar('\n');
+	if (ctl->json)
+		ul_jsonwrt_object_close(&ctl->jfmt);
+	else
+		putchar('\n');
 }
 
 /*
@@ -1149,7 +1198,7 @@ static int init_kmsg(struct dmesg_control *ctl)
 	 * but read() returns -EINVAL :-(((
 	 *
 	 * Let's try to read the first record. The record is later processed in
-	 * read_kmsg().
+	 * process_kmsg().
 	 */
 	ctl->kmsg_first_read = read_kmsg_one(ctl);
 	if (ctl->kmsg_first_read < 0) {
@@ -1192,7 +1241,7 @@ static int parse_kmsg_record(struct dmesg_control *ctl,
 
 	/* A) priority and facility */
 	if (ctl->fltr_lev || ctl->fltr_fac || ctl->decode ||
-	    ctl->raw || ctl->color)
+	    ctl->raw || ctl->color || ctl->json)
 		p = parse_faclev(p, &rec->facility, &rec->level);
 	else
 		p = skip_item(p, end, ",");
@@ -1257,7 +1306,7 @@ mesg:
  *
  * Returns 0 on success, -1 on error.
  */
-static int read_kmsg(struct dmesg_control *ctl)
+static int process_kmsg(struct dmesg_control *ctl)
 {
 	struct dmesg_record rec;
 	ssize_t sz;
@@ -1315,7 +1364,7 @@ static inline int dmesg_get_boot_time(struct timeval *tv)
 	return get_boot_time(tv);
 }
 
-static inline time_t dmesg_get_suspended_time(void)
+static inline usec_t dmesg_get_suspended_time(void)
 {
 	if (getenv("DMESG_TEST_BOOTIME"))
 		return 0;
@@ -1364,6 +1413,7 @@ int main(int argc, char *argv[])
 		{ "follow-new",    no_argument,       NULL, 'W' },
 		{ "human",         no_argument,       NULL, 'H' },
 		{ "help",          no_argument,	      NULL, 'h' },
+		{ "json",          no_argument,       NULL, 'J' },
 		{ "kernel",        no_argument,       NULL, 'k' },
 		{ "level",         required_argument, NULL, 'l' },
 		{ "since",	   required_argument, NULL, OPT_SINCE },
@@ -1403,7 +1453,7 @@ int main(int argc, char *argv[])
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	while ((c = getopt_long(argc, argv, "CcDdEeF:f:HhkL::l:n:iPprSs:TtuVWwx",
+	while ((c = getopt_long(argc, argv, "CcDdEeF:f:HhJkL::l:n:iPprSs:TtuVWwx",
 				longopts, NULL)) != -1) {
 
 		err_exclusive_options(c, longopts, excl, excl_st);
@@ -1434,13 +1484,16 @@ int main(int argc, char *argv[])
 		case 'f':
 			ctl.fltr_fac = 1;
 			if (string_to_bitarray(optarg,
-					     ctl.facilities, parse_facility) < 0)
+					     ctl.facilities, parse_facility, 0) < 0)
 				return EXIT_FAILURE;
 			break;
 		case 'H':
 			ctl.time_fmt = DMESG_TIMEFTM_RELTIME;
 			colormode = UL_COLORMODE_AUTO;
 			ctl.pager = 1;
+			break;
+		case 'J':
+			ctl.json = 1;
 			break;
 		case 'k':
 			ctl.fltr_fac = 1;
@@ -1455,7 +1508,8 @@ int main(int argc, char *argv[])
 		case 'l':
 			ctl.fltr_lev= 1;
 			if (string_to_bitarray(optarg,
-					     ctl.levels, parse_level) < 0)
+					     ctl.levels, parse_level,
+					     ARRAY_SIZE(level_names)) < 0)
 				return EXIT_FAILURE;
 			break;
 		case 'n':
@@ -1509,18 +1563,14 @@ int main(int argc, char *argv[])
 			break;
 		case OPT_SINCE:
 		{
-			usec_t p;
-			if (parse_timestamp(optarg, &p) < 0)
+			if (parse_timestamp(optarg, &ctl.since) < 0)
 				errx(EXIT_FAILURE, _("invalid time value \"%s\""), optarg);
-			ctl.since = (time_t) (p / 1000000);
 			break;
 		}
 		case OPT_UNTIL:
 		{
-			usec_t p;
-			if (parse_timestamp(optarg, &p) < 0)
+			if (parse_timestamp(optarg, &ctl.until) < 0)
 				errx(EXIT_FAILURE, _("invalid time value \"%s\""), optarg);
-			ctl.until = (time_t) (p / 1000000);
 			break;
 		}
 		case 'h':
@@ -1537,16 +1587,27 @@ int main(int argc, char *argv[])
 		errtryhelp(EXIT_FAILURE);
 	}
 
+	if (ctl.json) {
+		ctl.time_fmt = DMESG_TIMEFTM_TIME;
+		delta = 0;
+		ctl.force_prefix = 0;
+		ctl.raw = 0;
+		ctl.noesc = 1;
+		nopager = 1;
+	}
+
 	if ((is_timefmt(&ctl, RELTIME) ||
 	     is_timefmt(&ctl, CTIME)   ||
-	     is_timefmt(&ctl, ISO8601))) {
+	     is_timefmt(&ctl, ISO8601)) ||
+	     ctl.since ||
+	     ctl.until) {
 		if (dmesg_get_boot_time(&ctl.boot_time) != 0)
 			ctl.time_fmt = DMESG_TIMEFTM_NONE;
 		else
 			ctl.suspended_time = dmesg_get_suspended_time();
 	}
 
-	if (delta)
+	if (delta) {
 		switch (ctl.time_fmt) {
 		case DMESG_TIMEFTM_CTIME:
 			ctl.time_fmt = DMESG_TIMEFTM_CTIME_DELTA;
@@ -1560,14 +1621,13 @@ int main(int argc, char *argv[])
 		default:
 			ctl.time_fmt = DMESG_TIMEFTM_DELTA;
 		}
+	}
 
-
-	ctl.color = colors_init(colormode, "dmesg") ? 1 : 0;
+	if (!ctl.json)
+		ctl.color = colors_init(colormode, "dmesg") ? 1 : 0;
 	if (ctl.follow)
 		nopager = 1;
 	ctl.pager = nopager ? 0 : ctl.pager;
-	if (ctl.pager)
-		pager_redirect();
 
 	switch (ctl.action) {
 	case SYSLOG_ACTION_READ_ALL:
@@ -1584,22 +1644,26 @@ int main(int argc, char *argv[])
 		/* only kmsg supports multi-line messages */
 		if (ctl.force_prefix && ctl.method != DMESG_METHOD_KMSG)
 			ctl.force_prefix = 0;
-
 		if (ctl.pager)
 			pager_redirect();
-		n = read_buffer(&ctl, &buf);
+		n = process_buffer(&ctl, &buf);
 		if (n > 0)
 			print_buffer(&ctl, buf, n);
 		if (!ctl.mmap_buff)
 			free(buf);
 		if (ctl.kmsg >= 0)
 			close(ctl.kmsg);
+		if (ctl.json && ul_jsonwrt_is_ready(&ctl.jfmt)) {
+			ul_jsonwrt_array_close(&ctl.jfmt);
+			ul_jsonwrt_root_close(&ctl.jfmt);
+		}
 		if (n < 0)
 			err(EXIT_FAILURE, _("read kernel buffer failed"));
 		else if (ctl.action == SYSLOG_ACTION_READ_CLEAR)
-			; /* fallthrough */
+			;
 		else
 			break;
+		/* fallthrough */
 	case SYSLOG_ACTION_CLEAR:
 		if (klogctl(SYSLOG_ACTION_CLEAR, NULL, 0) < 0)
 			err(EXIT_FAILURE, _("clear kernel buffer failed"));

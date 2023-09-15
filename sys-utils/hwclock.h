@@ -9,6 +9,7 @@
 
 #include "c.h"
 #include "debug.h"
+#include "nls.h"
 
 #define HWCLOCK_DEBUG_INIT		(1 << 0)
 #define HWCLOCK_DEBUG_RANDOM_SLEEP	(1 << 1)
@@ -29,6 +30,8 @@ struct hwclock_control {
 #ifdef __linux__
 	char *rtc_dev_name;
 #endif
+	char *param_get_option;
+	char *param_set_option;
 	unsigned int
 		hwaudit_on:1,
 		adjust:1,
@@ -50,6 +53,8 @@ struct hwclock_control {
 		set:1,
 		update:1,
 		universal:1,	/* will store hw_clock_is_utc() return value */
+		vl_read:1,
+		vl_clear:1,
 		verbose:1;
 };
 
@@ -62,8 +67,8 @@ struct clock_ops {
 	const char *(*get_device_path) (void);
 };
 
-extern struct clock_ops *probe_for_cmos_clock(void);
-extern struct clock_ops *probe_for_rtc_clock(const struct hwclock_control *ctl);
+extern const struct clock_ops *probe_for_cmos_clock(void);
+extern const struct clock_ops *probe_for_rtc_clock(const struct hwclock_control *ctl);
 
 /* hwclock.c */
 extern double time_diff(struct timeval subtrahend, struct timeval subtractor);
@@ -73,6 +78,20 @@ extern double time_diff(struct timeval subtrahend, struct timeval subtractor);
 extern int get_epoch_rtc(const struct hwclock_control *ctl, unsigned long *epoch);
 extern int set_epoch_rtc(const struct hwclock_control *ctl);
 #endif
+
+struct hwclock_param {
+	int id;
+	const char *name;
+	const char *help;
+};
+
+extern const struct hwclock_param *get_hwclock_params(void);
+extern int get_param_rtc(const struct hwclock_control *ctl,
+			const char *name, uint64_t *id, uint64_t *value);
+extern int set_param_rtc(const struct hwclock_control *ctl, const char *name);
+
+extern int rtc_vl_read(const struct hwclock_control *ctl);
+extern int rtc_vl_clear(const struct hwclock_control *ctl);
 
 extern void __attribute__((__noreturn__))
 hwclock_exit(const struct hwclock_control *ctl, int status);

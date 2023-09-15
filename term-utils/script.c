@@ -131,6 +131,8 @@ struct script_control {
 
 	const char *ttyname;
 	const char *ttytype;
+	const char *command;
+	char *command_norm;	/* normalized (without \n) */
 	int ttycols;
 	int ttylines;
 
@@ -389,23 +391,28 @@ static int log_start(struct script_control *ctl,
 	switch (log->format) {
 	case SCRIPT_FMT_RAW:
 	{
+		int x = 0;
 		char buf[FORMAT_TIMESTAMP_MAX];
 		time_t tvec = script_time((time_t *)NULL);
 
 		strtime_iso(&tvec, ISO_TIMESTAMP, buf, sizeof(buf));
 		fprintf(log->fp, _("Script started on %s ["), buf);
 
+		if (ctl->command)
+			x += fprintf(log->fp, "COMMAND=\"%s\"", ctl->command_norm);
+
 		if (ctl->isterm) {
 			init_terminal_info(ctl);
 
 			if (ctl->ttytype)
-				fprintf(log->fp, "TERM=\"%s\" ", ctl->ttytype);
+				x += fprintf(log->fp, "%*sTERM=\"%s\"", !!x, "", ctl->ttytype);
 			if (ctl->ttyname)
-				fprintf(log->fp, "TTY=\"%s\" ", ctl->ttyname);
+				x += fprintf(log->fp, "%*sTTY=\"%s\"", !!x, "", ctl->ttyname);
 
-			fprintf(log->fp, "COLUMNS=\"%d\" LINES=\"%d\"", ctl->ttycols, ctl->ttylines);
+			x += fprintf(log->fp, "%*sCOLUMNS=\"%d\" LINES=\"%d\"", !!x, "",
+					ctl->ttycols, ctl->ttylines);
 		} else
-			fprintf(log->fp, _("<not executed on terminal>"));
+			fprintf(log->fp, _("%*s<not executed on terminal>"), !!x, "");
 
 		fputs("]\n", log->fp);
 		break;
@@ -671,7 +678,7 @@ static int callback_log_stream_activity(void *data, int fd, char *buf, size_t bu
 	if (ssz < 0)
 		return (int) ssz;
 
-	DBG(IO, ul_debug(" append %ld bytes [summary=%zu, max=%zu]", ssz,
+	DBG(IO, ul_debug(" append %zd bytes [summary=%" PRIu64 ", max=%" PRIu64 "]", ssz,
 				ctl->outsz, ctl->maxsz));
 
 	ctl->outsz += ssz;
@@ -756,7 +763,7 @@ int main(int argc, char **argv)
 	struct ul_pty_callbacks *cb;
 	int ch, format = 0, caught_signal = 0, rc = 0, echo = 1;
 	const char *outfile = NULL, *infile = NULL;
-	const char *timingfile = NULL, *shell = NULL, *command = NULL;
+	const char *timingfile = NULL, *shell = NULL;
 
 	enum { FORCE_OPTION = CHAR_MAX + 1 };
 
@@ -811,7 +818,9 @@ int main(int argc, char **argv)
 			ctl.append = 1;
 			break;
 		case 'c':
-			command = optarg;
+			ctl.command = optarg;
+			ctl.command_norm = xstrdup(ctl.command);
+			strrep(ctl.command_norm, '\n', ' ');
 			break;
 		case 'E':
 			if (strcmp(optarg, "auto") == 0)
@@ -880,15 +889,24 @@ int main(int argc, char **argv)
 
 	/* default if no --log-* specified */
 	if (!outfile && !infile) {
-		if (argc > 0)
+		if (argc > 0) {
 			outfile = argv[0];
-		else {
+			argc--;
+			argv++;
+		} else {
 			die_if_link(&ctl, DEFAULT_TYPESCRIPT_FILENAME);
 			outfile = DEFAULT_TYPESCRIPT_FILENAME;
 		}
 
 		/* associate stdout with typescript file */
 		log_associate(&ctl, &ctl.out, outfile, SCRIPT_FMT_RAW);
+	}
+
+	if (argc > 0) {
+		/* only one filename is accepted. if --log-out was given,
+		 * freestanding filename is ignored */
+		warnx(_("unexpected number of arguments"));
+		errtryhelp(EXIT_FAILURE);
 	}
 
 	if (timingfile) {
@@ -938,13 +956,16 @@ int main(int argc, char **argv)
 		printf(_(".\n"));
 	}
 
-#ifdef HAVE_LIBUTEMPTER
-	utempter_add_record(ul_pty_get_childfd(ctl.pty), NULL);
-#endif
 
 	if (ul_pty_setup(ctl.pty))
 		err(EXIT_FAILURE, _("failed to create pseudo-terminal"));
 
+#ifdef HAVE_LIBUTEMPTER
+	utempter_add_record(ul_pty_get_childfd(ctl.pty), NULL);
+#endif
+
+	if (ul_pty_signals_setup(ctl.pty))
+		err(EXIT_FAILURE, _("failed to initialize signals handler"));
 	fflush(stdout);
 
 	/*
@@ -969,15 +990,15 @@ int main(int argc, char **argv)
 		shname = shname ? shname + 1 : shell;
 
 		if (access(shell, X_OK) == 0) {
-			if (command)
-				execl(shell, shname, "-c", command, (char *)NULL);
+			if (ctl.command)
+				execl(shell, shname, "-c", ctl.command, (char *)NULL);
 			else
 				execl(shell, shname, "-i", (char *)NULL);
 		} else {
-			if (command)
-				execlp(shname, "-c", command, (char *)NULL);
+			if (ctl.command)
+				execlp(shname, shname, "-c", ctl.command, (char *)NULL);
 			else
-				execlp(shname, "-i", (char *)NULL);
+				execlp(shname, shname, "-i", (char *)NULL);
 		}
 
 		err(EXIT_FAILURE, "failed to execute %s", shell);
@@ -1010,8 +1031,8 @@ int main(int argc, char **argv)
 			log_info(&ctl, "LINES", "%d", ctl.ttylines);
 		}
 		log_info(&ctl, "SHELL", "%s", shell);
-		if (command)
-			log_info(&ctl, "COMMAND", "%s", command);
+		if (ctl.command)
+			log_info(&ctl, "COMMAND", "%s", ctl.command_norm);
 		log_info(&ctl, "TIMING_LOG", "%s", timingfile);
 		if (outfile)
 			log_info(&ctl, "OUTPUT_LOG", "%s", outfile);

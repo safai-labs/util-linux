@@ -1,3 +1,7 @@
+/*
+ * No copyright is claimed.  This code is in the public domain; do with
+ * it what you wish.
+ */
 	{0x00, N_("Empty")},
 	{0x01, N_("FAT12")},
 	{0x02, N_("XENIX root")},
@@ -101,6 +105,7 @@
 	{0xf1, N_("SpeedStor")},
 	{0xf4, N_("SpeedStor")},	/* SpeedStor large partition */
 	{0xf2, N_("DOS secondary")},	/* DOS 3.3+ secondary */
+	{0xf8, N_("EBBR protective")},	/* Arm EBBR firmware protective partition */
 	{0xfb, N_("VMware VMFS")},
 	{0xfc, N_("VMware VMKCORE")},	/* VMware kernel dump partition */
 	{0xfd, N_("Linux raid autodetect")},/* Linux raid partition with

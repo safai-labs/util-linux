@@ -46,6 +46,7 @@
 #include <grp.h>
 #include <pwd.h>
 #include <utmpx.h>
+#include <path.h>
 
 #ifdef HAVE_LASTLOG_H
 # include <lastlog.h>
@@ -203,12 +204,12 @@ static void timedout(int sig __attribute__((__unused__)))
  */
 static void sig_handler(int signal)
 {
-	if (child_pid)
+	if (child_pid > 0) {
 		kill(-child_pid, signal);
-	else
+		if (signal == SIGTERM)
+			kill(-child_pid, SIGHUP);	/* because the shell often ignores SIGTERM */
+	} else
 		got_sig = 1;
-	if (signal == SIGTERM)
-		kill(-child_pid, SIGHUP);	/* because the shell often ignores SIGTERM */
 }
 
 /*
@@ -513,6 +514,7 @@ static void init_tty(struct login_context *cxt)
 {
 	struct stat st;
 	struct termios tt, ttt;
+	struct winsize ws;
 
 	cxt->tty_mode = (mode_t) getlogindefs_num("TTYPERM", TTY_MODE);
 
@@ -542,6 +544,12 @@ static void init_tty(struct login_context *cxt)
 		snprintf(cxt->vcsan, sizeof(cxt->vcsan), "/dev/vcsa%s", cxt->tty_number);
 	}
 #endif
+
+	/* The TTY size might be reset to 0x0 by the kernel when we close the stdin/stdout/stderr file
+	 * descriptors so let's save the size now so we can reapply it later */
+	memset(&ws, 0, sizeof(struct winsize));
+	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) < 0)
+		syslog(LOG_WARNING, _("TIOCGWINSZ ioctl failed: %m"));
 
 	tcgetattr(0, &tt);
 	ttt = tt;
@@ -574,6 +582,11 @@ static void init_tty(struct login_context *cxt)
 
 	/* restore tty modes */
 	tcsetattr(0, TCSAFLUSH, &tt);
+
+	/* Restore tty size */
+	if ((ws.ws_row > 0 || ws.ws_col > 0)
+	    && ioctl(STDIN_FILENO, TIOCSWINSZ, &ws) < 0)
+		syslog(LOG_WARNING, _("TIOCSWINSZ ioctl failed: %m"));
 }
 
 /*
@@ -1275,6 +1288,38 @@ static void __attribute__((__noreturn__)) usage(void)
 	exit(EXIT_SUCCESS);
 }
 
+static void load_credentials(struct login_context *cxt) {
+	char *env;
+	DIR *dir;
+	struct dirent *d;
+	struct path_cxt *pc;
+
+	env = safe_getenv("CREDENTIALS_DIRECTORY");
+        if (!env)
+                return;
+
+	pc = ul_new_path("%s", env);
+	if (!pc) {
+		syslog(LOG_WARNING, _("failed to initialize path context"));
+		return;
+	}
+
+	dir = ul_path_opendir(pc, NULL);
+	if (!dir) {
+		syslog(LOG_WARNING, _("failed to open credentials directory"));
+		return;
+	}
+
+	while ((d = xreaddir(dir))) {
+		char str[32] = { 0 };
+
+		if (strcmp(d->d_name, "login.noauth") == 0
+		    && ul_path_read_buffer(pc, str, sizeof(str), d->d_name) > 0
+		    && *str && strcmp(str, "yes") == 0)
+			cxt->noauth = 1;
+	}
+}
+
 static void initialize(int argc, char **argv, struct login_context *cxt)
 {
 	int c;
@@ -1305,6 +1350,8 @@ static void initialize(int argc, char **argv, struct login_context *cxt)
 
 	setpriority(PRIO_PROCESS, 0, 0);
 	process_title_init(argc, argv);
+
+	load_credentials(cxt);
 
 	while ((c = getopt_long(argc, argv, "fHh:pV", longopts, NULL)) != -1)
 		switch (c) {
@@ -1520,6 +1567,9 @@ int main(int argc, char **argv)
 	}
 
 	child_argv[child_argc++] = NULL;
+
+	/* http://www.linux-pam.org/Linux-PAM-html/adg-interface-by-app-expected.html#adg-pam_end */
+	(void) pam_end(cxt.pamh, PAM_SUCCESS|PAM_DATA_SILENT);
 
 	execvp(child_argv[0], child_argv + 1);
 

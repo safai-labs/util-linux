@@ -149,34 +149,22 @@ done:
 /* Directories where we will try to search for device names */
 static const char *dirlist[] = { "/dev", "/devfs", "/devices", NULL };
 
+/*
+ * Return 1 if the device is a device-mapper 'leaf' node
+ * not holding any other devices in its hierarchy.
+ */
 static int is_dm_leaf(const char *devname)
 {
-	struct dirent	*de, *d_de;
-	DIR		*dir, *d_dir;
-	char		path[NAME_MAX + 18 + 1];
-	int		ret = 1;
+	DIR *dir;
+	char path[NAME_MAX + 18 + 1];
+	int ret;
 
-	if ((dir = opendir("/sys/block")) == NULL)
+	snprintf(path, sizeof(path), "/sys/block/%s/holders", devname);
+	if ((dir = opendir(path)) == NULL)
 		return 0;
-	while ((de = readdir(dir)) != NULL) {
-		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..") ||
-		    !strcmp(de->d_name, devname) ||
-		    strncmp(de->d_name, "dm-", 3) != 0 ||
-		    strlen(de->d_name) > sizeof(path)-32)
-			continue;
-		sprintf(path, "/sys/block/%s/slaves", de->d_name);
-		if ((d_dir = opendir(path)) == NULL)
-			continue;
-		while ((d_de = readdir(d_dir)) != NULL) {
-			if (!strcmp(d_de->d_name, devname)) {
-				ret = 0;
-				break;
-			}
-		}
-		closedir(d_dir);
-		if (!ret)
-			break;
-	}
+
+	ret = xreaddir(dir) == NULL ? 1 : 0;	/* 'leaf' has no entries */
+
 	closedir(dir);
 	return ret;
 }
@@ -321,14 +309,16 @@ static void lvm_probe_all(blkid_cache cache, int only_if_new)
 		char		*vdirname;
 		char		*vg_name;
 		struct dirent	*lv_iter;
+		size_t		len;
 
 		vg_name = vg_iter->d_name;
 		if (!strcmp(vg_name, ".") || !strcmp(vg_name, ".."))
 			continue;
-		vdirname = malloc(vg_len + strlen(vg_name) + 8);
+		len = vg_len + strlen(vg_name) + 8;
+		vdirname = malloc(len);
 		if (!vdirname)
 			goto exit;
-		sprintf(vdirname, "%s/%s/LVs", VG_DIR, vg_name);
+		snprintf(vdirname, len, "%s/%s/LVs", VG_DIR, vg_name);
 
 		lv_list = opendir(vdirname);
 		free(vdirname);
@@ -342,16 +332,16 @@ static void lvm_probe_all(blkid_cache cache, int only_if_new)
 			if (!strcmp(lv_name, ".") || !strcmp(lv_name, ".."))
 				continue;
 
-			lvm_device = malloc(vg_len + strlen(vg_name) +
-					    strlen(lv_name) + 8);
+			len = vg_len + strlen(vg_name) + strlen(lv_name) + 8;
+			lvm_device = malloc(len);
 			if (!lvm_device) {
 				closedir(lv_list);
 				goto exit;
 			}
-			sprintf(lvm_device, "%s/%s/LVs/%s", VG_DIR, vg_name,
+			snprintf(lvm_device, len, "%s/%s/LVs/%s", VG_DIR, vg_name,
 				lv_name);
 			dev = lvm_get_devno(lvm_device);
-			sprintf(lvm_device, "%s/%s", vg_name, lv_name);
+			snprintf(lvm_device, len, "%s/%s", vg_name, lv_name);
 			DBG(DEVNAME, ul_debug("Probe LVM dev %s: devno 0x%04X",
 						  lvm_device,
 						  (unsigned int) dev));
@@ -426,6 +416,8 @@ sysfs_probe_all(blkid_cache cache, int only_if_new, int only_removable)
 	sysfs = opendir(_PATH_SYS_BLOCK);
 	if (!sysfs)
 		return -BLKID_ERR_SYSFS;
+
+	DBG(DEVNAME, ul_debug(" probe /sys/block"));
 
 	/* scan /sys/block */
 	while ((dev = xreaddir(sysfs))) {
@@ -531,14 +523,18 @@ sysfs_probe_all(blkid_cache cache, int only_if_new, int only_removable)
 /*
  * Read the device data for all available block devices in the system.
  */
-static int probe_all(blkid_cache cache, int only_if_new)
+static int probe_all(blkid_cache cache, int only_if_new, int update_interval)
 {
+	int rc;
+
 	if (!cache)
 		return -BLKID_ERR_PARAM;
 
 	if (cache->bic_flags & BLKID_BIC_FL_PROBED &&
-	    time(NULL) - cache->bic_time < BLKID_PROBE_INTERVAL)
+	    time(NULL) - cache->bic_time < BLKID_PROBE_INTERVAL) {
+		DBG(PROBE, ul_debug("don't re-probe [delay < %d]", BLKID_PROBE_INTERVAL));
 		return 0;
+	}
 
 	blkid_read_cache(cache);
 #ifdef VG_DIR
@@ -546,7 +542,13 @@ static int probe_all(blkid_cache cache, int only_if_new)
 #endif
 	ubi_probe_all(cache, only_if_new);
 
-	sysfs_probe_all(cache, only_if_new, 0);
+	rc = sysfs_probe_all(cache, only_if_new, 0);
+
+	/* Don't mark the change as "probed" if /sys not avalable */
+	if (update_interval && rc == 0) {
+		cache->bic_time = time(NULL);
+		cache->bic_flags |= BLKID_BIC_FL_PROBED;
+	}
 
 	blkid_flush_cache(cache);
 	return 0;
@@ -565,11 +567,7 @@ int blkid_probe_all(blkid_cache cache)
 	int ret;
 
 	DBG(PROBE, ul_debug("Begin blkid_probe_all()"));
-	ret = probe_all(cache, 0);
-	if (ret == 0) {
-		cache->bic_time = time(NULL);
-		cache->bic_flags |= BLKID_BIC_FL_PROBED;
-	}
+	ret = probe_all(cache, 0, 1);
 	DBG(PROBE, ul_debug("End blkid_probe_all() [rc=%d]", ret));
 	return ret;
 }
@@ -587,7 +585,7 @@ int blkid_probe_all_new(blkid_cache cache)
 	int ret;
 
 	DBG(PROBE, ul_debug("Begin blkid_probe_all_new()"));
-	ret = probe_all(cache, 1);
+	ret = probe_all(cache, 1, 0);
 	DBG(PROBE, ul_debug("End blkid_probe_all_new() [rc=%d]", ret));
 	return ret;
 }

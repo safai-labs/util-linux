@@ -2,7 +2,7 @@
 ////
 uclampset(1) manpage
 
-Copyright (C) 2020-2021 Qais Yousef <qais.yousef@arm.com>
+Copyright (C) 2020-2021 Qais Yousef <qyousef@layalina.io>
 Copyright (C) 2020-2021 Arm Ltd
 
 This is free documentation; you can redistribute it and/or
@@ -60,6 +60,10 @@ By setting a task's _uclamp_max_ below 1024, this will effectively cap the task 
 
 The full utilization range is: [0:1024]. The special value -1 is used to reset to system's default.
 
+Consult latest kernel documentation for more details:
+
+	https://kernel.org/doc/html/latest/scheduler/sched-util-clamp.html
+
 == OPTIONS
 
 *-m*::
@@ -83,11 +87,7 @@ Set *SCHED_FLAG_RESET_ON_FORK* flag.
 *-v*, *--verbose*::
 Show status information.
 
-*-V*, *--version*::
-Display version information and exit.
-
-*-h*, *--help*::
-Display help text and exit.
+include::man-common/help-version.adoc[]
 
 == USAGE
 
@@ -125,7 +125,7 @@ Consult your kernel docs for the exact expected behavior on that kernel.
 
 == AUTHORS
 
-mailto:qais.yousef@arm.com[Qais Yousef]
+mailto:qyousef@layalina.io[Qais Yousef]
 
 == SEE ALSO
 

@@ -78,7 +78,7 @@ void addfile(char *name, struct hexdump *hex)
 {
 	char *fmt, *buf = NULL;
 	FILE *fp;
-	size_t n;
+	size_t n = 0;
 
 	if ((fp = fopen(name, "r")) == NULL)
 	        err(EXIT_FAILURE, _("can't read %s"), name);
@@ -204,10 +204,12 @@ int block_size(struct hexdump_fs *fs)
 			 * skip any special chars -- save precision in
 			 * case it's a %s format.
 			 */
-			while (strchr(spec + 1, *++fmt))
+			while (strchr(spec + 1, *++fmt) && *fmt != '\0')
 				;
 			if (*fmt == '.' && isdigit(*++fmt))
 				fmt = next_number(fmt, &prec);
+			if (*fmt == '\0')
+				badfmt(fu->fmt);
 			if (first_letter(fmt, "diouxX"))
 				bcnt += 4;
 			else if (first_letter(fmt, "efgEG"))
