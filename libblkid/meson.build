@@ -55,6 +55,7 @@ lib_blkid_sources = '''
   src/superblocks/bitlocker.c
   src/superblocks/bluestore.c
   src/superblocks/btrfs.c
+  src/superblocks/cellfs.c
   src/superblocks/cs_fvault2.c
   src/superblocks/cramfs.c
   src/superblocks/ddf_raid.c
@@ -81,7 +82,6 @@ lib_blkid_sources = '''
   src/superblocks/mpool.c
   src/superblocks/netware.c
   src/superblocks/nilfs.c
-  src/superblocks/cellfs.c
   src/superblocks/ntfs.c
   src/superblocks/refs.c
   src/superblocks/nvidia_raid.c

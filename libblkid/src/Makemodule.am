@@ -50,6 +50,7 @@ libblkid_la_SOURCES = \
 	libblkid/src/superblocks/bitlocker.c \
 	libblkid/src/superblocks/bluestore.c \
 	libblkid/src/superblocks/btrfs.c \
+	libblkid/src/superblocks/cellfs.c \
 	libblkid/src/superblocks/cs_fvault2.c \
 	libblkid/src/superblocks/cramfs.c \
 	libblkid/src/superblocks/ddf_raid.c \
@@ -76,7 +77,6 @@ libblkid_la_SOURCES = \
 	libblkid/src/superblocks/mpool.c \
 	libblkid/src/superblocks/netware.c \
 	libblkid/src/superblocks/nilfs.c \
-	libblkid/src/superblocks/cellfs.c \
 	libblkid/src/superblocks/ntfs.c \
 	libblkid/src/superblocks/refs.c \
 	libblkid/src/superblocks/nvidia_raid.c \
