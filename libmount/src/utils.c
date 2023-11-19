@@ -1288,8 +1288,12 @@ done:
 }
 
 #ifdef TEST_PROGRAM
-static int test_match_fstype(struct libmnt_test *ts, int argc, char *argv[])
+static int test_match_fstype(struct libmnt_test *ts __attribute__((unused)),
+			     int argc, char *argv[])
 {
+	if (argc != 3)
+		return -1;
+
 	char *type = argv[1];
 	char *pattern = argv[2];
 
@@ -1297,8 +1301,12 @@ static int test_match_fstype(struct libmnt_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-static int test_match_options(struct libmnt_test *ts, int argc, char *argv[])
+static int test_match_options(struct libmnt_test *ts __attribute__((unused)),
+			      int argc, char *argv[])
 {
+	if (argc != 3)
+		return -1;
+
 	char *optstr = argv[1];
 	char *pattern = argv[2];
 
@@ -1306,8 +1314,12 @@ static int test_match_options(struct libmnt_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-static int test_startswith(struct libmnt_test *ts, int argc, char *argv[])
+static int test_startswith(struct libmnt_test *ts __attribute__((unused)),
+			   int argc, char *argv[])
 {
+	if (argc != 3)
+		return -1;
+
 	char *optstr = argv[1];
 	char *pattern = argv[2];
 
@@ -1315,8 +1327,12 @@ static int test_startswith(struct libmnt_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-static int test_endswith(struct libmnt_test *ts, int argc, char *argv[])
+static int test_endswith(struct libmnt_test *ts __attribute__((unused)),
+			 int argc, char *argv[])
 {
+	if (argc != 3)
+		return -1;
+
 	char *optstr = argv[1];
 	char *pattern = argv[2];
 
@@ -1324,8 +1340,12 @@ static int test_endswith(struct libmnt_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-static int test_mountpoint(struct libmnt_test *ts, int argc, char *argv[])
+static int test_mountpoint(struct libmnt_test *ts __attribute__((unused)),
+			   int argc, char *argv[])
 {
+	if (argc != 2)
+		return -1;
+
 	char *path = canonicalize_path(argv[1]),
 	     *mnt = path ? mnt_get_mountpoint(path) :  NULL;
 
@@ -1335,10 +1355,15 @@ static int test_mountpoint(struct libmnt_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-static int test_filesystems(struct libmnt_test *ts, int argc, char *argv[])
+static int test_filesystems(struct libmnt_test *ts __attribute__((unused)),
+			    int argc, char *argv[])
 {
 	char **filesystems = NULL;
 	int rc;
+
+	if (argc != 2)
+		return -1;
+
 
 	rc = mnt_get_filesystems(&filesystems, argc ? argv[1] : NULL);
 	if (!rc) {
@@ -1350,8 +1375,12 @@ static int test_filesystems(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-static int test_chdir(struct libmnt_test *ts, int argc, char *argv[])
+static int test_chdir(struct libmnt_test *ts __attribute__((unused)),
+		      int argc, char *argv[])
 {
+	if (argc != 2)
+		return -1;
+
 	int rc;
 	char *path = canonicalize_path(argv[1]),
 	     *last = NULL;
@@ -1369,8 +1398,12 @@ static int test_chdir(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-static int test_kernel_cmdline(struct libmnt_test *ts, int argc, char *argv[])
+static int test_kernel_cmdline(struct libmnt_test *ts __attribute__((unused)),
+			       int argc, char *argv[])
 {
+	if (argc != 2)
+		return -1;
+
 	char *name = argv[1];
 	char *res;
 
@@ -1388,7 +1421,8 @@ static int test_kernel_cmdline(struct libmnt_test *ts, int argc, char *argv[])
 }
 
 
-static int test_guess_root(struct libmnt_test *ts, int argc, char *argv[])
+static int test_guess_root(struct libmnt_test *ts __attribute__((unused)),
+			   int argc, char *argv[])
 {
 	int rc;
 	char *real;
@@ -1414,9 +1448,13 @@ static int test_guess_root(struct libmnt_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-static int test_mkdir(struct libmnt_test *ts, int argc, char *argv[])
+static int test_mkdir(struct libmnt_test *ts __attribute__((unused)),
+	 	      int argc, char *argv[])
 {
 	int rc;
+
+	if (argc != 2)
+		return -1;
 
 	rc = ul_mkdir_p(argv[1], S_IRWXU |
 			 S_IRGRP | S_IXGRP |
@@ -1426,10 +1464,14 @@ static int test_mkdir(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-static int test_statfs_type(struct libmnt_test *ts, int argc, char *argv[])
+static int test_statfs_type(struct libmnt_test *ts __attribute__((unused)),
+			    int argc, char *argv[])
 {
 	struct statfs vfs;
 	int rc;
+
+	if (argc != 2)
+		return -1;
 
 	rc = statfs(argv[1], &vfs);
 	if (rc)
@@ -1441,8 +1483,12 @@ static int test_statfs_type(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-static int tests_parse_uid(struct libmnt_test *ts, int argc, char *argv[])
+static int tests_parse_uid(struct libmnt_test *ts __attribute__((unused)),
+			   int argc, char *argv[])
 {
+	if (argc != 2)
+		return -1;
+
 	char *str = argv[1];
 	uid_t uid = (uid_t) -1;
 	int rc;
@@ -1456,8 +1502,12 @@ static int tests_parse_uid(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-static int tests_parse_gid(struct libmnt_test *ts, int argc, char *argv[])
+static int tests_parse_gid(struct libmnt_test *ts __attribute__((unused)),
+			   int argc, char *argv[])
 {
+	if (argc != 2)
+		return -1;
+
 	char *str = argv[1];
 	gid_t gid = (gid_t) -1;
 	int rc;
@@ -1471,8 +1521,12 @@ static int tests_parse_gid(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-static int tests_parse_mode(struct libmnt_test *ts, int argc, char *argv[])
+static int tests_parse_mode(struct libmnt_test *ts __attribute__((unused)),
+			    int argc, char *argv[])
 {
+	if (argc != 2)
+		return -1;
+
 	char *str = argv[1];
 	mode_t mod = (mode_t) -1;
 	int rc;
@@ -1489,8 +1543,12 @@ static int tests_parse_mode(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-static int tests_stat(struct libmnt_test *ts, int argc, char *argv[])
+static int tests_stat(struct libmnt_test *ts __attribute__((unused)),
+		      int argc, char *argv[])
 {
+	if (argc != 2)
+		return -1;
+
 	char *path = argv[1];
 	struct stat st;
 	int rc;
