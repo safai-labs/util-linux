@@ -2103,7 +2103,7 @@ exe = executable(
   dependencies: [lib_selinux],
   install_dir : sbindir,
   install : true)
-if opt and not is_disabler(exe)
+if not is_disabler(exe)
   exes += exe
   manadocs += ['disk-utils/mkswap.8.adoc']
   bashcompletions += ['mkswap']
@@ -2118,7 +2118,7 @@ exe = executable(
                lib_uuid],
   install_dir : sbindir,
   install : true)
-if opt and not is_disabler(exe)
+if not is_disabler(exe)
   exes += exe
   manadocs += ['disk-utils/swaplabel.8.adoc']
   bashcompletions += ['swaplabel']
